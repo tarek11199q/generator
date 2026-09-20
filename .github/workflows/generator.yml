@@ -61,6 +61,7 @@ on:
           - zedge_1
           - zedge_2
           - zedge_3
+          - zedge_4
           - all_accounts
 
       gemini_session:
@@ -203,13 +204,14 @@ jobs:
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           // <-- CONFIG: your Firebase Realtime Database URLs (same as in index.html / Core.kt / zedgeN.yml)
           const FIREBASE_DB_MAP = {
-            zedge_1: 'https://zedge-1-default-rtdb.firebaseio.com',
-            zedge_2: 'https://zedge2-34d95-default-rtdb.firebaseio.com',
-            zedge_3: 'https://zedge3-1b3dc-default-rtdb.firebaseio.com'
+            zedge_1: 'https://YOUR-ZEDGE1-PROJECT-default-rtdb.firebaseio.com',
+            zedge_2: 'https://YOUR-ZEDGE2-PROJECT-default-rtdb.firebaseio.com',
+            zedge_3: 'https://YOUR-ZEDGE3-PROJECT-default-rtdb.firebaseio.com',
+            zedge_4: 'https://YOUR-ZEDGE4-PROJECT-default-rtdb.firebaseio.com'
           };
 
           // ─── R2 WORKER URL ────────────────────────────────────────────────────────
-          const R2_WORKER_URL = 'https://tarek.henrydelacruz0t7.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL
+          const R2_WORKER_URL = 'https://YOUR-R2-WORKER.YOUR-SUBDOMAIN.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL
 
           // Resolve which DB URLs to target
           let TARGET_DB_URLS;
@@ -218,7 +220,7 @@ jobs:
           } else if (FIREBASE_DB_MAP[TARGET_ACCOUNT]) {
             TARGET_DB_URLS = [{ name: TARGET_ACCOUNT, url: FIREBASE_DB_MAP[TARGET_ACCOUNT] }];
           } else {
-            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, all_accounts`);
+            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, zedge_4, all_accounts`);
             process.exit(1);
           }
 
@@ -1732,9 +1734,10 @@ jobs:
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           // <-- CONFIG: your Firebase Realtime Database URLs (same as in index.html / Core.kt / zedgeN.yml)
           const FIREBASE_DB_MAP = {
-            zedge_1: 'https://zedge-1-default-rtdb.firebaseio.com',
-            zedge_2: 'https://zedge2-34d95-default-rtdb.firebaseio.com',
-            zedge_3: 'https://zedge3-1b3dc-default-rtdb.firebaseio.com'
+            zedge_1: 'https://YOUR-ZEDGE1-PROJECT-default-rtdb.firebaseio.com',
+            zedge_2: 'https://YOUR-ZEDGE2-PROJECT-default-rtdb.firebaseio.com',
+            zedge_3: 'https://YOUR-ZEDGE3-PROJECT-default-rtdb.firebaseio.com',
+            zedge_4: 'https://YOUR-ZEDGE4-PROJECT-default-rtdb.firebaseio.com'
           };
 
           let TARGET_DB_URLS;
@@ -2696,6 +2699,6 @@ jobs:
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Mode | Auto-scan (all images missing metadata) |" >> $GITHUB_STEP_SUMMARY
           echo "| Queue path | ${{ github.event.inputs.image_queue_path }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3, zedge_4) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Image metadata generated via Gemini Web (image upload) and patched back to Firebase." >> $GITHUB_STEP_SUMMARY
