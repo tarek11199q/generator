@@ -278,7 +278,7 @@ jobs:
           console.log('============================================================\n');
 
           // ─── GEMINI VIA WEB SCRAPING (uses saved Google session) ───────────────────
-          async function callGeminiWeb(promptText, geminiPage) {
+          async function callGeminiWeb(promptText, geminiPage, opts = {}) {
             console.log(`    🌐 Sending prompt (${promptText.length} chars)...`);
 
             // Click input and clear it
@@ -315,6 +315,12 @@ jobs:
 
             // Poll: wait for the new response element to appear, then stabilize
             const deadline = Date.now() + 90000;
+            // v27.10: a reply is only accepted once it contains the closing tag of the LAST template section
+            // (opts.completeWhen). Before, a 3 s pause while Gemini was still streaming was mistaken for a
+            // finished answer -> half a template got parsed -> the audio prompt silently fell back to
+            // "electronic synth pulse" while title/tags described another sound (ringtone != metadata).
+            const completeRe = opts.completeWhen || null;
+            const softDeadline = Date.now() + 75000;   // after this a stable partial reply is accepted (the parser validates it)
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -354,7 +360,7 @@ jobs:
               // Track stability
               if (latestText === lastSeen) {
                 stableCount++;
-                if (stableCount >= 2) {
+                if (stableCount >= 2 && (!completeRe || completeRe.test(latestText) || Date.now() > softDeadline)) {
                   responseText = latestText;
                   break;
                 }
@@ -613,8 +619,17 @@ jobs:
                 RECENT_CONCEPTS.map((c, i) => `${i + 1}. ${c}`).join('\n') + `\n\n`
               : '';
 
+            // v27.10: the audio is rendered by a text-to-MUSIC model. It cannot make realistic animal calls, speech,
+            // laughter or real-world foley - asking for "a lion roar" yields a synth pad titled "Lion Roar", i.e. the
+            // sound does not match its metadata. Gemini is told what the renderer can do and that TITLE / KEYWORDS /
+            // DESCRIPTION must describe the ENHANCED_PROMPT literally (same instruments, mood, tempo).
+            const RENDERER_RULES = `AUDIO RENDERER FACTS (the ENHANCED_PROMPT is sent VERBATIM to a text-to-MUSIC AI model that renders exactly ${LENGTH_SECONDS} seconds; nothing is edited afterwards):\n` +
+              `- It renders instruments, genres, rhythm, tempo, mood and synthetic textures very well.\n` +
+              `- It CANNOT produce realistic animal calls, human voices, speech, laughter, words or recognizable real-world recordings (rain, typing, crowds, engines, sirens...). When the theme is such a sound, translate it into a MUSICAL equivalent (lion roar -> deep growling brass swell over tribal drums; thunderstorm -> rumbling timpani and dark low strings; keyboard typing -> crisp woodblock and rimshot pattern) and describe THAT.\n` +
+              `- TITLE, KEYWORDS and DESCRIPTION must describe ONLY what the ENHANCED_PROMPT will literally sound like. Never promise a sound, voice or effect that is not written in the ENHANCED_PROMPT. Every keyword must be justified by a word or idea present in the ENHANCED_PROMPT; use the same instrument, genre and mood words in both.`;
+
             // Construct the single, unified consolidated prompt
-            const CONSOLIDATED_PROMPT = `You are an award-winning mobile sound designer and metadata optimizer. Your ringtones and notification sounds top marketplace charts because they are wildly creative, instantly catchy, and a genuine pleasure to hear — people happily pay for them.\n\n${ZEDGE_POLICY_RULES}\n\n` +
+            const CONSOLIDATED_PROMPT = `You are an award-winning mobile sound designer and metadata optimizer. Your ringtones and notification sounds top marketplace charts because they are wildly creative, instantly catchy, and a genuine pleasure to hear — people happily pay for them.\n\n${ZEDGE_POLICY_RULES}\n\n${RENDERER_RULES}\n\n` +
               (prompt 
                 ? `I want to generate a ${soundType} based on this idea: "${prompt}".\n` +
                   `Rewrite it into a vivid, detailed 30-word text-to-music prompt with organic, high-definition textures.\n\n${craftRules}\n\n[Salt: ${randomSalt}]\n\n`
@@ -646,13 +661,23 @@ jobs:
             await sleep(2000);
 
             // Send the single consolidated prompt
-            const responseText = await callGeminiWeb(CONSOLIDATED_PROMPT, geminiPage);
+            const responseText = await callGeminiWeb(CONSOLIDATED_PROMPT, geminiPage, { completeWhen: /\[\s*\/\s*DESCRIPTION\s*\]/i });
 
             // Parser helper for tags
             const getTagValue = (text, tag) => {
-              const regex = new RegExp(`\\[${tag}\\]([\\s\\S]*?)\\[\\/${tag}\\]`, 'i');
-              const match = text.match(regex);
-              return match ? match[1].trim() : '';
+              // v27.10 tolerant parser: Gemini renders markdown, so "[ENHANCED_PROMPT]" can come back as
+              // "**[ENHANCED PROMPT]**", "[ENHANCEDPROMPT]", with a ":" after it, or without its closing tag.
+              // The old strict regex then returned '' and the caller silently used a fallback value.
+              const t = tag.replace(/_/g, '[_ \\-]?');
+              const open = new RegExp(`\\[\\s*${t}\\s*\\]\\s*:?`, 'i');
+              const m = text.match(open);
+              if (!m) return '';
+              let rest = text.slice(m.index + m[0].length);
+              const close = rest.match(new RegExp(`\\[\\s*\\/\\s*${t}\\s*\\]`, 'i'));
+              if (close) rest = rest.slice(0, close.index);
+              else { const nx = rest.match(/\[\s*\/?\s*(ENHANCED[_ -]?PROMPT|TITLE|KEYWORDS|CATEGORY|DESCRIPTION|POLICY)\s*\]/i); if (nx) rest = rest.slice(0, nx.index); }
+              rest = rest.replace(/\*\*/g, '').replace(/^`+|`+$/g, '').replace(/^\s*:\s*/, '').trim();
+              return /^(\.{3}|\u2026)$/.test(rest) ? '' : rest;   // the literal "..." template placeholder counts as missing
             };
 
             const r0 = getTagValue(responseText, 'ENHANCED_PROMPT');
@@ -661,11 +686,36 @@ jobs:
             const r3 = getTagValue(responseText, 'CATEGORY');
             const r4 = getTagValue(responseText, 'DESCRIPTION');
 
-            const enhancedPrompt = r0.replace(/^["']|["']$/g, '').trim() || prompt || 'electronic synth pulse';
+            // v27.10: never fall back silently. A missing ENHANCED_PROMPT / TITLE / KEYWORDS throws, so the caller
+            // retries in a fresh chat (3 attempts). Before, a half-parsed reply made Stable Audio render the generic
+            // fallback "electronic synth pulse" while the stored title/tags described a completely different sound.
+            const missing = [];
+            if (!r0 || r0.split(/\s+/).filter(Boolean).length < 5) missing.push('ENHANCED_PROMPT');
+            if (!r1) missing.push('TITLE');
+            if (!r2) missing.push('KEYWORDS');
+            if (missing.length) {
+              console.warn(`  ⚠️ Gemini reply incomplete - missing ${missing.join(', ')} | reply head: "${responseText.slice(0, 180).replace(/\s+/g, ' ')}"`);
+              throw new Error(`Gemini reply incomplete (missing ${missing.join(', ')}) - regenerating`);
+            }
+            if (!r3) console.warn('  ⚠️ CATEGORY tag missing -> OTHER');
+            if (!r4) console.warn('  ⚠️ DESCRIPTION tag missing -> derived from the title');
+            const enhancedPrompt = r0.replace(/^["']|["']$/g, '').trim();
             const finalTitle = cleanTitle(r1) || (prompt || 'Random Ringtone').split(' ').slice(0, 4).join(' ').slice(0, 30);
             const finalTags = cleanKeywords(r2);
             const finalCategory = cleanCategory(r3);
-            const finalDesc = cleanDescription(r4);
+            const finalDesc = cleanDescription(r4) || finalTitle;
+
+            // v27.10 alignment guard: the tags must describe the ENHANCED_PROMPT (= what Stable Audio actually renders).
+            // Zero overlap between tag stems and prompt words means the metadata talks about another sound -> regenerate.
+            const promptWords = (enhancedPrompt.toLowerCase().match(/[a-z]{3,}/g) || []);
+            const stem = (w) => w.slice(0, 4);
+            const tagList = finalTags.split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+            const overlap = tagList.filter(tg => promptWords.some(w => w.startsWith(stem(tg)) || tg.startsWith(stem(w))));
+            if (tagList.length && overlap.length === 0) {
+              console.warn(`  ⚠️ Tags do not describe the audio prompt (0 overlap) - regenerating. Prompt: "${enhancedPrompt.slice(0, 100)}" | Tags: ${finalTags}`);
+              throw new Error('metadata does not describe the audio prompt - regenerating');
+            }
+            console.log(`  🔗 Metadata/audio alignment: ${overlap.length}/${tagList.length} tags found in the audio prompt`);
 
             console.log(`  ✨ Enhanced Prompt: "${enhancedPrompt}"`);
             rememberConcept(finalTitle, enhancedPrompt);
@@ -1285,7 +1335,8 @@ jobs:
             console.log(`  🏷️  [${dbTarget.name}] Tags: ${meta.tags}  ✅ policy-checked`);
 
             // Step B: Generate unique audio (each call gets a random seed → different sound)
-            const { resultUrl } = await generateStableAudio(meta.enhancedPrompt, LENGTH_SECONDS);
+            const { resultUrl, seed } = await generateStableAudio(meta.enhancedPrompt, LENGTH_SECONDS);
+            console.log(`  🎼 [${dbTarget.name}] Audio prompt sent to Stable Audio: "${meta.enhancedPrompt}"`);
             let audioBuffer = await pollStableAudioResult(resultUrl);
 
             // Step C: Optional auto-processing (silence trim + normalize + volume boost)
@@ -1331,7 +1382,10 @@ jobs:
               policyCheck: 'passed',
               policyCheckedAt: Date.now(),
               status: 'queued',
-              prompt,
+              prompt: prompt || meta.enhancedPrompt,   // v27.10: what the audio model was really asked (shown as "Generation prompt" in panel/app/desktop)
+              enhancedPrompt: meta.enhancedPrompt,
+              audioSeed: seed,
+              audioModel: 'stable-audio-v2-5',
               // Audio processing audit trail (visible in panel/app item details)
               autoProcess: AUTO_PROCESS,
               processed,
@@ -2067,7 +2121,7 @@ jobs:
           }
 
           // ─── GEMINI WEB: SEND TEXT PROMPT AND WAIT FOR RESPONSE ──────────────────
-          async function callGeminiWeb(promptText, geminiPage) {
+          async function callGeminiWeb(promptText, geminiPage, opts = {}) {
             console.log(`    🌐 Sending prompt (${promptText.length} chars)...`);
 
             const inputSel = 'div.ql-editor[contenteditable="true"]';
@@ -2103,6 +2157,12 @@ jobs:
             console.log(`    ⌨️  Submitted via Enter key`);
 
             const deadline = Date.now() + 90000;
+            // v27.10: a reply is only accepted once it contains the closing tag of the LAST template section
+            // (opts.completeWhen). Before, a 3 s pause while Gemini was still streaming was mistaken for a
+            // finished answer -> half a template got parsed -> the audio prompt silently fell back to
+            // "electronic synth pulse" while title/tags described another sound (ringtone != metadata).
+            const completeRe = opts.completeWhen || null;
+            const softDeadline = Date.now() + 75000;   // after this a stable partial reply is accepted (the parser validates it)
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -2134,7 +2194,7 @@ jobs:
 
               if (latestText === lastSeen) {
                 stableCount++;
-                if (stableCount >= 2) { responseText = latestText; break; }
+                if (stableCount >= 2 && (!completeRe || completeRe.test(latestText) || Date.now() > softDeadline)) { responseText = latestText; break; }
               } else {
                 lastSeen = latestText;
                 stableCount = 0;
@@ -2442,13 +2502,23 @@ jobs:
               `[DESCRIPTION]...[/DESCRIPTION]\n` +
               `[POLICY]OK or FLAG: reason[/POLICY]`;
 
-            const responseText = await callGeminiWeb(METADATA_PROMPT, geminiPage);
+            const responseText = await callGeminiWeb(METADATA_PROMPT, geminiPage, { completeWhen: /\[\s*\/\s*POLICY\s*\]/i });
 
             // Parse response tags
             const getTagValue = (text, tag) => {
-              const regex = new RegExp(`\\[${tag}\\]([\\s\\S]*?)\\[\\/${tag}\\]`, 'i');
-              const match = text.match(regex);
-              return match ? match[1].trim() : '';
+              // v27.10 tolerant parser: Gemini renders markdown, so "[ENHANCED_PROMPT]" can come back as
+              // "**[ENHANCED PROMPT]**", "[ENHANCEDPROMPT]", with a ":" after it, or without its closing tag.
+              // The old strict regex then returned '' and the caller silently used a fallback value.
+              const t = tag.replace(/_/g, '[_ \\-]?');
+              const open = new RegExp(`\\[\\s*${t}\\s*\\]\\s*:?`, 'i');
+              const m = text.match(open);
+              if (!m) return '';
+              let rest = text.slice(m.index + m[0].length);
+              const close = rest.match(new RegExp(`\\[\\s*\\/\\s*${t}\\s*\\]`, 'i'));
+              if (close) rest = rest.slice(0, close.index);
+              else { const nx = rest.match(/\[\s*\/?\s*(ENHANCED[_ -]?PROMPT|TITLE|KEYWORDS|CATEGORY|DESCRIPTION|POLICY)\s*\]/i); if (nx) rest = rest.slice(0, nx.index); }
+              rest = rest.replace(/\*\*/g, '').replace(/^`+|`+$/g, '').replace(/^\s*:\s*/, '').trim();
+              return /^(\.{3}|\u2026)$/.test(rest) ? '' : rest;   // the literal "..." template placeholder counts as missing
             };
 
             const title       = cleanTitle(getTagValue(responseText, 'TITLE'))       || `Image ${key.slice(0, 8)}`;
