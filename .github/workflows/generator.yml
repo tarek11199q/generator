@@ -1,4 +1,4 @@
-name: "☁️ Generator Hub - Ringtone + Metadata (single workflow)"
+name: "☁️ Generator Hub - Ringtone + Image Studio + Metadata (single workflow)"
 run-name: "🎯 MODE: ${{ inputs.mode }}"
 
 on:
@@ -12,6 +12,7 @@ on:
         options:
           - ringtone
           - metadata
+          - image_studio
 
       image_queue_path:
         description: "📂 Firebase path to scan for images"
@@ -67,6 +68,20 @@ on:
         description: "🌐 Gemini Web Session JSON (paste storageState JSON — no API key needed!)"
         required: false
         default: ""
+
+      studio_timeout_minutes:
+        description: "🎨 [image_studio] Max panel session length in minutes (5–330; job hard limit is 360)"
+        required: false
+        default: "240"
+
+      studio_auto_metadata:
+        description: "🎨 [image_studio] Gemini-Web metadata BEFORE distribute (title/tags/category written into each Firebase record, like the ringtone job) + final pass at the end"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
   generate-ringtones:
@@ -201,7 +216,6 @@ jobs:
           }
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
-          // <-- CONFIG: your Firebase Realtime Database URLs (same as in index.html / Core.kt / zedgeN.yml)
           const FIREBASE_DB_MAP = {
             zedge_1: 'https://zedge-1-default-rtdb.firebaseio.com',
             zedge_2: 'https://zedge2-34d95-default-rtdb.firebaseio.com',
@@ -209,7 +223,7 @@ jobs:
           };
 
           // ─── R2 WORKER URL ────────────────────────────────────────────────────────
-          const R2_WORKER_URL = 'https://tarek.henrydelacruz0t7.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL
+          const R2_WORKER_URL = 'https://tarek.henrydelacruz0t7.workers.dev';
 
           // Resolve which DB URLs to target
           let TARGET_DB_URLS;
@@ -1574,10 +1588,33 @@ jobs:
           fi
           echo "> Ringtones pushed to Firebase with status **queued** — Zedge bot will pick them up on next run." >> $GITHUB_STEP_SUMMARY
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 🖼️ IMAGE METADATA  +  🎨 IMAGE STUDIO (mode = image_studio)
+  #    mode=metadata     → scan all DBs, write Gemini-Web metadata (unchanged behaviour).
+  #    mode=image_studio → bulk prompts → Cloudinary image generation → 1620×2880 JPGs
+  #                        → R2 + Firebase distribution, driven from a control panel that is
+  #                        exposed through a Cloudflare quick tunnel (trycloudflare.com).
+  #                        Metadata order = SAME as the ringtone job: as soon as a set / image
+  #                        is rendered, the SAME image_metadata.mjs (Gemini Web, local-jobs
+  #                        mode, one browser for the whole session) writes title / tags /
+  #                        category / description + Zedge policy verdict; ONLY THEN the record
+  #                        is pushed to Firebase WITH that metadata (status queued, or
+  #                        status failed + policyCheck held when flagged). The Zedge bot never
+  #                        sees a "metadata missing" record. A final Firebase-scan pass still
+  #                        runs after the session as a safety net.
+  #    🔒 One image / set → ONE Zedge account only (no all_accounts, item lock, SHA-256 file
+  #       ledger, no frame regeneration after distribution) — duplicate content across
+  #       accounts gets Zedge accounts suspended. To feed all accounts from one batch use
+  #       target "spread": item 1 → zedge_1, item 2 → zedge_2, … (least-loaded first), so
+  #       every account gets DIFFERENT files. target_account=all_accounts falls back to
+  #       zedge_2 in the studio; ringtone/metadata modes are unchanged.
+  #    If your power/internet drops, the runner keeps generating; reopen the same link.
+  # ═══════════════════════════════════════════════════════════════════════════
   generate-image-metadata:
-    if: github.event.inputs.mode == 'metadata'
-    name: 🖼️ Generate Image Metadata → Firebase
+    if: github.event.inputs.mode == 'metadata' || github.event.inputs.mode == 'image_studio'
+    name: ${{ github.event.inputs.mode == 'image_studio' && '🎨 Image Studio → tunnel panel → R2 + Firebase + Gemini metadata' || '🖼️ Generate Image Metadata → Firebase' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: 📦 Setup Node.js
@@ -1599,11 +1636,7 @@ jobs:
           echo "DISPLAY=:99" >> $GITHUB_ENV
           echo "✅ Xvfb virtual display started on :99"
 
-      - name: 🖼️ Generate Image Metadata & Patch Firebase
-        env:
-          GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
-          GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
-          IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
+      - name: 📝 Write Gemini-Web metadata script (image_metadata.mjs)
         run: |
           cat > image_metadata.mjs << 'IMGMETA_EOF'
           import fetch from 'node-fetch';
@@ -1784,7 +1817,6 @@ jobs:
           console.log(`   Cookies: ${GEMINI_STORAGE_STATE.cookies.length}, Origins: ${GEMINI_STORAGE_STATE.origins.length}`);
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
-          // <-- CONFIG: your Firebase Realtime Database URLs (same as in index.html / Core.kt / zedgeN.yml)
           const FIREBASE_DB_MAP = {
             zedge_1: 'https://zedge-1-default-rtdb.firebaseio.com',
             zedge_2: 'https://zedge2-34d95-default-rtdb.firebaseio.com',
@@ -2636,7 +2668,77 @@ jobs:
           let totalHeld = 0;
           let totalFailed  = 0;
 
-          for (const db of TARGET_DB_URLS) {
+          // ─── LOCAL-JOBS MODE (Image Studio, mode: image_studio) ──────────────────
+          // When META_LOCAL_DIR is set the script does NOT scan Firebase. Instead it watches
+          // META_LOCAL_DIR/jobs/*.json  ({ id, imagePath, kind })  written by studio_server.mjs,
+          // runs the SAME Gemini-Web flow + Zedge policy check on the local JPG and writes
+          // META_LOCAL_DIR/results/<id>.json. The browser stays open until META_LOCAL_DIR/stop
+          // exists, so every set/image gets its title/tags/category BEFORE it is pushed to
+          // Firebase — exactly like the ringtone job (metadata first, then the queued record).
+          const META_LOCAL_DIR = (process.env.META_LOCAL_DIR || '').trim();
+          if (META_LOCAL_DIR) {
+            const jobsDir = path.join(META_LOCAL_DIR, 'jobs');
+            const resDir  = path.join(META_LOCAL_DIR, 'results');
+            const stopFile = path.join(META_LOCAL_DIR, 'stop');
+            fs.mkdirSync(jobsDir, { recursive: true });
+            fs.mkdirSync(resDir, { recursive: true });
+            console.log(`\n🗂️  Local-jobs mode — watching ${jobsDir} (Image Studio). Firebase scan is skipped.`);
+            console.log('   READY_FOR_LOCAL_JOBS');
+            let idleTicks = 0;
+            while (!fs.existsSync(stopFile)) {
+              const files = fs.readdirSync(jobsDir).filter(f => f.endsWith('.json')).sort();
+              if (!files.length) {
+                if (++idleTicks % 60 === 0) console.log('   💤 idle — waiting for new images…');
+                await sleep(2000);
+                continue;
+              }
+              idleTicks = 0;
+              for (const f of files) {
+                if (fs.existsSync(stopFile)) break;
+                const jobPath = path.join(jobsDir, f);
+                let job;
+                try { job = JSON.parse(fs.readFileSync(jobPath, 'utf8')); }
+                catch (e) { console.error(`  ❌ [local] bad job file ${f}: ${e.message}`); try { fs.unlinkSync(jobPath); } catch {} continue; }
+                const id = String(job.id || path.basename(f, '.json'));
+                const kind = SET_KINDS[job.kind] ? job.kind : 'WALLPAPER';
+                console.log(`\n  [local] Key: ${id} — ${kindLabel(kind)} (${path.basename(job.imagePath || '')})`);
+                const out = { id, kind, imagePath: job.imagePath, startedAt: Date.now() };
+                try {
+                  if (!job.imagePath || !fs.existsSync(job.imagePath)) throw new Error(`image file not found: ${job.imagePath}`);
+                  let metadata = await generateImageMetadata(job.imagePath, id, geminiPage, kind);
+                  let check = zedgeEnforce(metadata, 'image');
+                  if (check.issues.length) {
+                    console.warn(`  🚫 [local] [${id}] Zedge policy: ${check.issues.join('; ')} — regenerating metadata once`);
+                    await sleep(2000);
+                    metadata = await generateImageMetadata(job.imagePath, id, geminiPage, kind);
+                    check = zedgeEnforce(metadata, 'image');
+                  }
+                  const verdict = String(metadata.policy || '').trim();
+                  const flag = /^FLAG/i.test(verdict) ? verdict.replace(/^FLAG\s*:?\s*/i, '').trim() || 'flagged by policy review' : '';
+                  const reason = flag || (check.issues.length ? `metadata could not be made policy-safe: ${check.issues.join('; ')}` : '');
+                  Object.assign(out, {
+                    ok: true,
+                    title: check.meta.title, tags: check.meta.tags, category: check.meta.category, description: check.meta.description,
+                    policyCheck: reason ? 'held' : 'passed', policyFlag: reason, issues: check.issues, finishedAt: Date.now()
+                  });
+                  if (reason) { totalHeld++; console.warn(`  🛑 [local] [${id}] HELD (Zedge policy): ${reason}`); }
+                  else { totalSuccess++; console.log(`  ✅ [local] [${id}] Metadata generated: "${check.meta.title}" · ${check.meta.category}`); }
+                } catch (err) {
+                  totalFailed++;
+                  Object.assign(out, { ok: false, error: err.message, finishedAt: Date.now() });
+                  console.error(`  ❌ [local] [${id}] Failed: ${err.message}`);
+                }
+                const tmp = path.join(resDir, `${id}.json.tmp`);
+                fs.writeFileSync(tmp, JSON.stringify(out));
+                fs.renameSync(tmp, path.join(resDir, `${id}.json`));
+                try { fs.unlinkSync(jobPath); } catch {}
+                await sleep(2000);
+              }
+            }
+            console.log('\n🛑 [local] stop requested — closing Gemini browser.');
+          }
+
+          for (const db of (META_LOCAL_DIR ? [] : TARGET_DB_URLS)) {
             console.log(`\n🔥 Processing DB: ${db.name} (${db.url})`);
 
             let candidates;
@@ -2750,11 +2852,1632 @@ jobs:
           console.log(`⏭️  Already done: images with full metadata were skipped automatically`);
           console.log('============================================================');
 
-          if (totalFailed > 0 && totalSuccess === 0) {
+          if (totalFailed > 0 && totalSuccess === 0 && !META_LOCAL_DIR) {
             process.exit(1);
           }
           IMGMETA_EOF
+          node --check image_metadata.mjs && echo "✅ image_metadata.mjs written ($(wc -l < image_metadata.mjs) lines)"
+
+      - name: 🌩️ Install cloudflared (quick tunnel, no Cloudflare account needed)
+        if: github.event.inputs.mode == 'image_studio'
+        run: |
+          curl -fsSL -o /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          sudo apt-get install -y -qq zip > /dev/null
+          cloudflared --version
+
+
+      - name: 📝 Write Image Studio server
+        if: github.event.inputs.mode == 'image_studio'
+        run: |
+          cat > studio_server.mjs << 'STUDIO_EOF'
+          // ☁️ Image Studio server — runs inside the GitHub Actions runner, exposed via a Cloudflare quick tunnel.
+          // Bulk prompts → Cloudinary Image Generation API → 1620×2880 JPGs → (optional) R2 + Firebase distribution.
+          import http from 'http';
+          import fs from 'fs';
+          import path from 'path';
+          import { execSync, spawn } from 'child_process';
+          import crypto from 'crypto';
+
+          // ─── CONFIG ────────────────────────────────────────────────────────────────
+          const PORT            = parseInt(process.env.STUDIO_PORT || '8787', 10);
+          const TOKEN           = (process.env.STUDIO_TOKEN || crypto.randomBytes(12).toString('hex')).trim();
+          const TIMEOUT_MIN     = Math.min(330, Math.max(5, parseInt(process.env.STUDIO_TIMEOUT_MINUTES || '240', 10) || 240)); // GitHub job hard limit is 360 min
+          const OUT_DIR         = process.env.STUDIO_OUT_DIR || '/tmp/studio_out';
+          const RESULT_FILE     = process.env.STUDIO_RESULT_FILE || '/tmp/studio_result.json';
+          const R2_WORKER_URL   = process.env.R2_WORKER_URL || 'https://tarek.henrydelacruz0t7.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL (same as the ringtone job)
+          const METADATA_SCRIPT = process.env.METADATA_SCRIPT || path.resolve('image_metadata.mjs');
+          const GEMINI_AVAILABLE = !!((process.env.GEMINI_SESSION_INPUT || '').trim() || (process.env.GEMINI_SESSION || '').trim());
+          const META_DIR = process.env.STUDIO_META_DIR || '/tmp/studio_meta';   // job/result hand-off with image_metadata.mjs (local-jobs mode)
+          const VALID_IMG_CATS = ['ANIMALS', 'ANIME', 'CARS_N_VEHICLES', 'COMICS', 'DESIGNS', 'DRAWINGS', 'ENTERTAINMENT', 'FUNNY', 'GAMES', 'HOLIDAYS', 'LOVE', 'MUSIC', 'NATURE', 'OTHER', 'PATTERNS', 'PEOPLE', 'SAYINGS', 'SPACE', 'SPIRITUAL', 'SPORTS', 'TECHNOLOGY'];
+          const API_BASE        = process.env.STUDIO_API_BASE || 'https://api.cloudinary.com/v2';
+          const DELIVERY_BASE   = process.env.STUDIO_DELIVERY_BASE || 'https://res.cloudinary.com';
+          const WALL_W = 1620, WALL_H = 2880;
+
+          // <-- CONFIG: your Firebase Realtime Database URLs — MUST be the same as in the ringtone job and image_metadata.mjs above
+          const FIREBASE_DB_MAP = {
+            zedge_1: 'https://zedge-1-default-rtdb.firebaseio.com',
+            zedge_2: 'https://zedge2-34d95-default-rtdb.firebaseio.com',
+            zedge_3: 'https://zedge3-1b3dc-default-rtdb.firebaseio.com'
+          };
+
+          if (process.env.STUDIO_FIREBASE_MAP_JSON) { try { Object.assign(FIREBASE_DB_MAP, JSON.parse(process.env.STUDIO_FIREBASE_MAP_JSON)); } catch {} }
+
+          const TEXT_MODELS = [
+            'nano-banana-1', 'nano-banana-2-lite', 'nano-banana-2',
+            'flux-2-klein-9b', 'flux-2-flash', 'flux-2-pro',
+            'recraft-v3', 'recraft-v4', 'recraft-v4.1-utility', 'recraft-v4.1-utility-pro',
+            'gpt-image-1-mini', 'gpt-image-2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst',
+            'ideogram-v4-base', 'ideogram-v4-turbo',
+            'muse-image', 'mai-image-2.5',
+            'seedream-5-lite', 'seedream-5-pro',
+            'grok-imagine-image', 'grok-imagine-image-2.0-low',
+            'qwen-image-3'
+          ];
+          const EDIT_MODELS = [
+            'nano-banana-1-edit', 'nano-banana-2-lite-edit', 'nano-banana-2-edit',
+            'flux-2-klein-9b-edit', 'flux-2-flash-edit', 'flux-2-pro-edit',
+            'recraft-v3-edit',
+            'gpt-image-1-mini-edit', 'gpt-image-2-edit', 'gpt-image-2.5-flare-edit', 'gpt-image-2.5-sunburst-edit',
+            'muse-image-edit', 'mai-image-2.5-edit',
+            'seedream-5-lite-edit', 'seedream-5-pro-edit',
+            'grok-imagine-image-edit', 'grok-imagine-image-2.0-low-edit',
+            'qwen-image-3-edit'
+          ];
+          const RATIOS = { '9:16': [1620, 2880], '3:4': [2160, 2880], '1:1': [2160, 2160], '4:3': [2880, 2160], '16:9': [2880, 1620] };
+          const toEdit = m => (m.endsWith('-edit') ? m : m + '-edit');
+
+          // ─── PROMPT BUILDING (same rules as the Cloudinary Studio index.php) ───────
+          const BOOST = {
+            off: 'Natural, restrained color grading.',
+            soft: 'Gently enriched color: softly lifted saturation and a light luminous glow.',
+            vivid: 'Vivid eye-catching color: punchy saturation and strong but clean contrast.',
+            neon: 'Neon luxe grading: saturated neon accents against deep shadow, maximum screen impact while staying clean.',
+            ultra: 'Ultra impact grading: thumb-stopping saturation, bold contrast and dramatic light separation, without clipping detail.'
+          };
+          const DISPLAY = {
+            any: '',
+            amoled: 'Optimised for AMOLED: true black background areas and bright isolated highlights.',
+            lcd: 'Optimised for LCD: keep shadows slightly lifted so detail survives on bright panels.'
+          };
+          const BASE_RULES = 'Portrait 9:16 mobile wallpaper, vertical composition, keep the upper third clean for the clock and keep safe margins. No text, numbers, labels, signatures or watermarks. No phone frame, device mockup, border, collage or contact sheet. No humans, no copyrighted characters, franchises, brands or logos. Still image only.';
+          const BASE_RULES_FREE = 'Clean composition with safe margins. No text, numbers, labels, signatures or watermarks. No phone frame, device mockup, border, collage or contact sheet. No humans, no copyrighted characters, franchises, brands or logos. Still image only.';
+          const STRENGTH = {
+            subtle: { lock: 'Keep the same subject, composition, geometry, materials and style as the reference image [1]. Preserve the subject identity.', push: 'Apply the state described below so it is clearly noticeable when compared side by side with the reference.' },
+            clear:  { lock: 'Keep the same subject, identity, geometry, materials and art style as the reference image [1], and keep the camera framing similar.', push: 'This is an EDIT, not a copy: the lighting, glow, colours and sky MUST visibly change to match the state described below. Anyone comparing the two images must immediately see the difference.' },
+            strong: { lock: 'Keep only the subject identity, its shape and the art style from the reference image [1].', push: 'Transform the image boldly to match the state described below: relight the whole scene, change the sky/background tone, shadows, glow and colour palette dramatically. The result must look like a distinctly different moment of the same subject, never a near-duplicate of the reference.' }
+          };
+          const NO_DUPE = 'Do not return the reference unchanged. Do not add unplanned structures, duplicate the subject, or redesign it.';
+
+          // Frame "slot" names match the Firebase wallpaper-set records the metadata job + Zedge bot already read.
+          const SET_FRAMES = {
+            '24-HOUR': {
+              contentType: 'WALLPAPER_24H',
+              design: 'Design the scene so that time of day is unmistakable: include sky or ambient light, a dominant light source and visible shadows. This frame is the MORNING state.',
+              frames: [
+                { file: '01_morning.jpg',   slot: 'morning',   name: 'Morning',   instr: 'MORNING: pale cool-blue to soft peach sky, low sun from the side, long soft shadows, gentle mist, fresh muted palette, low contrast.' },
+                { file: '02_afternoon.jpg', slot: 'afternoon', name: 'Afternoon', instr: 'AFTERNOON: bright clear daylight, sun high overhead, short hard shadows, the brightest and most saturated frame, crisp clean contrast, no mist.' },
+                { file: '03_evening.jpg',   slot: 'evening',   name: 'Evening',   instr: 'EVENING / GOLDEN HOUR: deep orange-magenta sunset sky, very low warm sun, strong amber rim light on the subject, long dramatic shadows, warm dominant palette.' },
+                { file: '04_night.jpg',     slot: 'night',     name: 'Night',     instr: 'NIGHT: dark navy-black sky with stars or city glow, no sun, the subject lit only by its own glowing parts and cool moonlight, deep shadows, high-contrast neon highlights.' }
+              ]
+            },
+            'DUAL': {
+              contentType: 'WALLPAPER_DUAL',
+              design: 'This is the LOCK SCREEN frame: hero subject at 50–65% of frame width, placed lower-middle, upper third clean for the clock.',
+              frames: [
+                { file: '01_lock_screen.jpg', slot: 'lock', name: 'Lock screen', instr: 'LOCK SCREEN: hero subject roughly 50–65% of frame width, lower-middle, upper third clean for the clock. Strongest tasteful expression of the concept.' },
+                { file: '02_home_screen.jpg', slot: 'home', name: 'Home screen', instr: 'HOME SCREEN: pull the camera back to a clearly WIDER shot of the same scene: the subject is at most 30% of frame width and moved off-centre, more environment visible, calmer and darker overall so app icons stay readable. The framing must be obviously different from the reference.' }
+              ]
+            },
+            'BATTERY': {
+              contentType: 'WALLPAPER_BATTERY',
+              design: 'Design ONE clear energy pathway built into the subject: a glowing vertical channel (light strip, veins, circuit line, liquid level or crystal core) running from the very bottom to the very top of the subject, able to fill up like a gauge. In this frame the pathway is completely DORMANT: dark, unlit, grey/charcoal, zero glow. The subject is visible only through dim ambient light.',
+              frames: [
+                { file: '01_critical.jpg', slot: 'critical', name: 'Critical', instr: 'BATTERY CRITICAL (0–5%): the energy pathway is completely dormant: dark, unlit, grey/charcoal, zero glow anywhere except a faint dying red ember at the very bottom. Dim, low-key ambient lighting only.' },
+                { file: '02_low.jpg',      slot: 'low',      name: 'Low',      instr: 'BATTERY LOW (20%): the energy pathway glows brightly ONLY in its bottom 20% (the lowest fifth); the upper 80% stays dark and unlit. Faint coloured light spills onto nearby surfaces. Scene slightly brighter than the reference.' },
+                { file: '03_mid.jpg',      slot: 'mid',      name: 'Mid',      instr: 'BATTERY MID (50%): the energy pathway glows brightly from the bottom up to exactly half of its height; the upper half stays dark and unlit. Noticeable coloured glow spilling onto the subject. Scene clearly brighter than the reference.' },
+                { file: '04_high.jpg',     slot: 'high',     name: 'High',     instr: 'BATTERY HIGH (80%): the energy pathway glows from the bottom up to 80% of its height; only the top fifth remains dark. Intense saturated glow, bright rim light, energetic sparks or particles.' },
+                { file: '05_full.jpg',     slot: 'full',     name: 'Full',     instr: 'BATTERY FULL (100%): the ENTIRE energy pathway is lit end to end at maximum brightness, blazing saturated glow, light bloom, floating particles, the brightest and most vivid frame of the set.' },
+                { file: '06_charging.jpg', slot: 'charging', name: 'Charging', instr: 'BATTERY CHARGING: energy is visibly FLOWING UPWARD through the pathway: bright streaks, rising sparks, motion trails and a pulsing brighter core, with electric particles rising from the bottom. The pathway is lit about 60% with the top part showing incoming energy. Electric, dynamic mood.' }
+              ]
+            },
+            'SINGLE': {
+              contentType: 'WALLPAPER',
+              design: '',
+              frames: [{ file: '01_wallpaper.jpg', slot: 'single', name: 'Wallpaper', instr: 'One standalone wallpaper. No variants, no time states, no energy states, no companion image.' }]
+            }
+          };
+          const TYPE_ALIAS = { '24-HOUR': '24-HOUR', '24HOUR': '24-HOUR', '24': '24-HOUR', '24H': '24-HOUR', 'DAY': '24-HOUR', 'WALLPAPER24H': '24-HOUR', 'DUAL': 'DUAL', 'LOCKHOME': 'DUAL', 'WALLPAPERDUAL': 'DUAL', 'BATTERY': 'BATTERY', 'BAT': 'BATTERY', 'WALLPAPERBATTERY': 'BATTERY', 'SINGLE': 'SINGLE', 'ONE': 'SINGLE', 'WALLPAPER': 'SINGLE' };
+
+          const STOP = new Set('the a an and or of in on at to for with by from no not into over under this that these those is are be as it its very more most dark light color colour wallpaper mobile phone screen background image picture style concept creative eye catching'.split(' '));
+          const slug = t => (t || 'concept').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'concept';
+          const pad2 = n => String(n).padStart(2, '0');
+          const conceptFrom = p => (p.split(/[,.\n]/)[0].trim().split(/\s+/).slice(0, 5).join(' ') || 'Concept');
+          const tagsFrom = p => { const out = []; for (const w of p.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/)) { if (w.length > 2 && !STOP.has(w) && !out.includes(w)) out.push(w); if (out.length === 10) break; } return out; };
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const grading = s => [BOOST[s.boost] || '', DISPLAY[s.display] || ''].filter(Boolean).join(' ');
+
+          // ─── STATE ─────────────────────────────────────────────────────────────────
+          fs.mkdirSync(OUT_DIR, { recursive: true });
+          const STATE_FILE = path.join(OUT_DIR, 'studio_state.json');
+          const startedAt = Date.now();
+          const deadline  = startedAt + TIMEOUT_MIN * 60 * 1000;
+
+          const state = {
+            settings: {
+              model: 'gpt-image-2.5-sunburst', res: '2K', ratio: '9:16', boost: 'vivid', display: 'any', strength: 'clear', upscale: true,
+              concurrency: 2,
+              targetAccount: (FIREBASE_DB_MAP[(process.env.TARGET_ACCOUNT || '').trim().toLowerCase()] ? (process.env.TARGET_ACCOUNT || '').trim().toLowerCase() : 'zedge_2'),   // never "all_accounts" here
+              queuePath: (process.env.IMAGE_QUEUE_PATH || 'wallpaperQueue').trim(),
+              autoDistribute: false,
+              requireMetadata: true,
+              spreadPool: Object.keys(FIREBASE_DB_MAP),                 // accounts used by target "spread" (each item → one account, round-robin balanced)                                 // never push a record without title/tags/category (the Zedge bot skips those)
+              runMetadata: (process.env.STUDIO_AUTO_METADATA || 'true') !== 'false',
+              autoMetadata: (process.env.STUDIO_AUTO_METADATA || 'true') !== 'false',
+              autoFinishMinutes: 0
+            },
+            // Gemini-Web metadata worker = image_metadata.mjs in local-jobs mode (one browser, stays open for the whole session)
+            metaWorker: { available: GEMINI_AVAILABLE && fs.existsSync(METADATA_SCRIPT), running: false, ready: false, startedAt: 0, current: '', queued: 0, done: 0, held: 0, failed: 0, restarts: 0, error: '', lastExit: null },
+            items: [],
+            log: [],
+            paused: false,
+            finished: false,
+            finishReason: ''
+          };
+          const creds = {
+            cloud_name: (process.env.CLOUDINARY_CLOUD_NAME || '').trim(),
+            api_key: (process.env.CLOUDINARY_API_KEY || '').trim(),
+            api_secret: (process.env.CLOUDINARY_API_SECRET || '').trim()
+          };
+          // CLOUDINARY_URL=cloudinary://key:secret@cloud is also accepted
+          if ((!creds.cloud_name || !creds.api_key || !creds.api_secret) && process.env.CLOUDINARY_URL) {
+            const m = String(process.env.CLOUDINARY_URL).match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/?]+)/);
+            if (m) { creds.api_key = m[1]; creds.api_secret = m[2]; creds.cloud_name = m[3]; }
+          }
+          const hasCreds = () => !!(creds.cloud_name && creds.api_key && creds.api_secret);
+
+          let nextId = 1;
+          let lastActivity = Date.now();
+          function log(msg) {
+            const line = `[${new Date().toISOString().slice(11, 19)}] ${msg}`;
+            console.log(line);
+            state.log.push(line);
+            if (state.log.length > 400) state.log.splice(0, state.log.length - 400);
+          }
+          let saveTimer = null;
+          function saveState() {
+            clearTimeout(saveTimer);
+            saveTimer = setTimeout(() => {
+              try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, log: undefined }, null, 2)); } catch (e) { console.error('state save failed', e.message); }
+            }, 300);
+          }
+
+          // ─── CLOUDINARY ────────────────────────────────────────────────────────────
+          async function cloudinaryGenerate(mode, payload) {
+            if (!hasCreds()) throw new Error('Cloudinary credentials missing — add them in Settings.');
+            const auth = 'Basic ' + Buffer.from(`${creds.api_key}:${creds.api_secret}`).toString('base64');
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 300000);
+            let res, data;
+            try {
+              res = await fetch(`${API_BASE}/generate/${encodeURIComponent(creds.cloud_name)}/${mode}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: auth },
+                body: JSON.stringify(payload),
+                signal: ctrl.signal
+              });
+              const raw = await res.text();
+              try { data = JSON.parse(raw); } catch { data = { error: { message: raw.slice(0, 300) } }; }
+            } finally { clearTimeout(t); }
+            if (!res.ok) {
+              const e = data && data.error || {};
+              throw new Error(`${e.code ? e.code + ' ' : ''}${e.message || `HTTP ${res.status}`}`);
+            }
+            const asset = data.data && data.data.assets && data.data.assets[0];
+            if (!asset || !asset.storage || !asset.storage.asset_id) throw new Error('Cloudinary returned no managed asset.');
+            return asset;
+          }
+          function derivedUrl(storage, upscale, ratio) {
+            const [w, h] = RATIOS[ratio] || RATIOS['9:16'];
+            const v = storage.version ? `v${storage.version}/` : '';
+            return `${DELIVERY_BASE}/${creds.cloud_name}/image/upload/${upscale ? 'e_upscale/' : 'e_sharpen:60/'}c_fill,g_auto,w_${w},h_${h}/q_100/${v}${storage.public_id}.jpg`;
+          }
+          // Derived (e_upscale) assets answer 423 while Cloudinary renders them — retry.
+          async function downloadDerived(url) {
+            let lastStatus = 0;
+            for (let i = 0; i < 10; i++) {
+              const res = await fetch(url).catch(() => null);
+              if (res && res.ok) {
+                const buf = Buffer.from(await res.arrayBuffer());
+                if (buf.length > 1000) return buf;
+              }
+              lastStatus = res ? res.status : 0;
+              if (res && res.status !== 423 && res.status !== 429 && res.status < 500 && res.status !== 0) break;
+              await sleep(3000 + i * 1500);
+            }
+            throw new Error(`derived image download failed (HTTP ${lastStatus})`);
+          }
+
+          // ─── GENERATION WORKER ─────────────────────────────────────────────────────
+          function buildItem(o, index) {
+            const type = o.type, def = SET_FRAMES[type];
+            const concept = (o.concept || '').trim() || conceptFrom(o.prompt);
+            const st = { ...state.settings, ...(o.settings || {}) };
+            if (type !== 'SINGLE') st.ratio = '9:16';
+            const folder = `${pad2(index)}_${slug(concept)}_${type}`;
+            return {
+              id: nextId++, index, type, concept, prompt: o.prompt, folder,
+              settings: { model: st.model, res: st.res, ratio: st.ratio, boost: st.boost, display: st.display, strength: st.strength, upscale: !!st.upscale },
+              status: 'queued', anchorId: null, error: '',
+              frames: def.frames.map(f => ({ file: f.file, slot: f.slot, name: f.name, status: 'queued', url: '', localPath: '', size: 0, error: '', attempts: 0 })),
+              distributed: [], distributeStatus: '', distributeError: '',
+              // meta = Gemini-Web (or manual) Zedge metadata generated BEFORE distribution; metaStatus: '' | queued | running | done | held | failed | manual
+              meta: null, metaStatus: '', metaError: '',
+              metadata: { file: def.frames[0].file, title: concept.slice(0, 25), tags: tagsFrom(o.prompt || concept), category: 'DESIGNS', description: (o.prompt || concept).replace(/\s+/g, ' ').slice(0, 200) },
+              createdAt: Date.now()
+            };
+          }
+
+          async function generateFrame(item, f) {
+            const def = SET_FRAMES[item.type], frame = item.frames[f], fdef = def.frames[f], isAnchor = f === 0, st = item.settings;
+            if (!isAnchor && !item.anchorId) { frame.status = 'failed'; frame.error = 'anchor frame not ready'; return false; }
+            const base = st.model, editModel = EDIT_MODELS.includes(toEdit(base)) ? toEdit(base) : 'nano-banana-2-edit';
+            const grade = grading(st);
+            const rules = (item.type === 'SINGLE' && st.ratio !== '9:16') ? BASE_RULES_FREE : BASE_RULES;
+            const S = STRENGTH[st.strength] || STRENGTH.clear;
+            const prompt = isAnchor
+              ? [item.prompt, def.design, fdef.instr, grade, rules].filter(Boolean).join('\n\n')
+              : [item.prompt ? 'Concept: ' + item.prompt : '', S.lock, S.push, 'STATE TO RENDER — ' + fdef.instr, NO_DUPE, grade, rules].filter(Boolean).join('\n\n');
+            frame.status = 'running'; frame.error = ''; saveState();
+            let lastErr = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              frame.attempts++;
+              try {
+                const payload = {
+                  prompt,
+                  model: { id: isAnchor ? base : editModel },
+                  image_size: { aspect_ratio: st.ratio || '9:16', resolution: st.res || '2K' },
+                  format: 'png',
+                  target: { target_type: 'managed_asset', public_id: `zedge/${item.folder}/${fdef.file.replace(/\.jpg$/, '')}_${Date.now().toString(36)}` }
+                };
+                if (!isAnchor) payload.reference_images = [{ source_type: 'managed_asset', asset_id: item.anchorId }];
+                const asset = await cloudinaryGenerate(isAnchor ? 'text_to_image' : 'image_to_image', payload);
+                if (isAnchor) item.anchorId = asset.storage.asset_id;
+                const url = derivedUrl(asset.storage, st.upscale, st.ratio);
+                const buf = await downloadDerived(url);
+                const dir = path.join(OUT_DIR, item.folder); fs.mkdirSync(dir, { recursive: true });
+                const localPath = path.join(dir, fdef.file);
+                fs.writeFileSync(localPath, buf);
+                frame.url = url; frame.localPath = localPath; frame.size = buf.length; frame.status = 'done'; frame.error = '';
+                log(`✅ ${item.folder}/${fdef.file} (${(buf.length / 1024).toFixed(0)} KB)`);
+                saveState();
+                return true;
+              } catch (err) {
+                lastErr = err;
+                log(`⚠️ ${item.folder}/${fdef.file} attempt ${attempt}/3: ${err.message}`);
+                if (attempt < 3) await sleep(2000 * attempt);
+              }
+            }
+            frame.status = 'failed'; frame.error = lastErr ? lastErr.message : 'failed';
+            saveState();
+            return false;
+          }
+
+          function itemStatusFromFrames(item) {
+            const done = item.frames.filter(f => f.status === 'done').length;
+            if (done === item.frames.length) return 'done';
+            if (item.frames.some(f => f.status === 'running')) return 'running';
+            return done > 0 ? 'partial' : 'failed';
+          }
+
+          async function processItem(item) {
+            item.status = 'running'; item.error = ''; lastActivity = Date.now(); saveState();
+            log(`🎨 Generating ${item.folder} (${item.frames.length} frame${item.frames.length === 1 ? '' : 's'}) · ${item.settings.model}`);
+            // Anchor first (text_to_image); variants reference the anchor and run in parallel.
+            const anchorOk = item.frames[0].status === 'done' || await generateFrame(item, 0);
+            if (anchorOk && item.frames.length > 1) {
+              await Promise.all(item.frames.map((fr, i) => (i > 0 && fr.status !== 'done') ? generateFrame(item, i) : Promise.resolve(true)));
+            }
+            item.status = itemStatusFromFrames(item);
+            if (item.status !== 'done') item.error = item.frames.filter(f => f.status === 'failed').map(f => `${f.file}: ${f.error}`).join(' · ');
+            lastActivity = Date.now(); saveState();
+            if (item.status === 'done') {
+              // Same order as the ringtone job: metadata FIRST (Gemini Web), then the Firebase record.
+              if (!(item.meta && item.meta.title)) queueMetadata(item, 'generated');
+              maybeAutoDistribute(item);
+            }
+          }
+
+          let inFlight = 0;
+          let pumping = false;
+          async function pump() {
+            if (pumping) return; pumping = true;
+            try {
+              while (!state.finished && !state.paused && hasCreds()) {
+                const limit = Math.max(1, Math.min(4, parseInt(state.settings.concurrency, 10) || 1));
+                if (inFlight >= limit) break;
+                const next = state.items.find(i => i.status === 'queued');
+                if (!next) break;
+                inFlight++;
+                processItem(next).catch(e => { next.status = 'failed'; next.error = e.message; saveState(); }).finally(() => { inFlight--; pump(); });
+              }
+            } finally { pumping = false; }
+          }
+
+          // ─── DISTRIBUTION: Cloudinary JPG → R2 → Firebase (same schema as the panel / ringtone job) ──
+          // ⚠️ ONE ITEM → ONE ZEDGE ACCOUNT, ALWAYS. The same image/set in two Zedge accounts = duplicate content = suspension.
+          // There is deliberately NO "all accounts" target here, and the ledger below makes a second send impossible.
+          // target "spread" = DISTRIBUTE THE COLLECTION ACROSS THE ACCOUNTS: every item still goes to exactly ONE
+          // account, but consecutive items are spread round-robin over settings.spreadPool (least-loaded first),
+          // so zedge_1..4 each receive different sets / images and never the same file.
+          const SPREAD = 'spread';
+          function spreadCounts() {
+            const pool = (state.settings.spreadPool || []).filter(a => FIREBASE_DB_MAP[a]);
+            const counts = Object.fromEntries(pool.map(a => [a, 0]));
+            for (const it of state.items) { const a = it.lockedAccount || (it.distributed[0] && it.distributed[0].dbName); if (a && a in counts) counts[a]++; }
+            return { pool, counts };
+          }
+          let spreadCursor = 0;
+          function pickSpreadAccount() {
+            const { pool, counts } = spreadCounts();
+            if (!pool.length) throw new Error('Spread: no accounts selected in "Spread across" — tick at least one account.');
+            const min = Math.min(...pool.map(a => counts[a]));
+            const candidates = pool.filter(a => counts[a] === min);
+            const pick = candidates[spreadCursor % candidates.length]; spreadCursor++;
+            return pick;
+          }
+          function resolveTarget(target) {
+            const t = String(target || state.settings.targetAccount || 'zedge_2').toLowerCase();
+            return t === SPREAD ? pickSpreadAccount() : t;
+          }
+          function targetDbs(target) {
+            const t = String(target || state.settings.targetAccount || 'zedge_2').toLowerCase();
+            if (t === 'all_accounts' || t === 'all_four' || t === 'all_three') throw new Error('Sending one image/set to several Zedge accounts is blocked (duplicate content → account suspension). Pick one account, or "spread" to give each item to a different account.');
+            if (t === SPREAD) throw new Error('internal: resolve "spread" to one account first');
+            if (FIREBASE_DB_MAP[t]) return [{ name: t, url: FIREBASE_DB_MAP[t] }];
+            throw new Error(`Unknown target account "${target}"`);
+          }
+          async function uploadToR2(buffer, fileName, dbName) {
+            const cleaned = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const key = `${String(dbName).replace(/^zedge_?/i, 'zedge')}/wallpaper/${Date.now()}_${cleaned}`;
+            const res = await fetch(R2_WORKER_URL, { method: 'POST', headers: { 'X-File-Name': key, 'X-File-Type': 'image/jpeg' }, body: buffer }).catch(e => { throw netErr('R2 worker unreachable', e); });
+            if (!res.ok) throw new Error(`R2 upload failed (HTTP ${res.status}): ${(await res.text().catch(() => '')).slice(0, 200)}`);
+            const data = await res.json().catch(() => ({}));
+            if (!data.url) throw new Error(`R2 worker response missing 'url': ${JSON.stringify(data).slice(0, 200)}`);
+            return data.url;
+          }
+          const netErr = (what, e) => new Error(`${what}: ${e.message}${e.cause && e.cause.message ? ' (' + e.cause.message + ')' : ''}`);
+          async function firebasePush(dbUrl, queuePath, data) {
+            const res = await fetch(`${dbUrl}/${queuePath}.json`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).catch(e => { throw netErr('Firebase unreachable', e); });
+            if (!res.ok) throw new Error(`Firebase push failed (${res.status}): ${(await res.text().catch(() => '')).slice(0, 200)}`);
+            return (await res.json()).name;
+          }
+          // ─── DUPLICATE-CONTENT LEDGER (survives the whole session, also written to the artifact) ──
+          // sha256 of every JPG that was ever uploaded → { account, firebaseKey, folder, at }. Before any
+          // upload we check every frame of the item: if ANY byte-identical file was already sent to ANY
+          // account (same or different) the distribution is refused. Nothing is uploaded partially.
+          const LEDGER_FILE = path.join(OUT_DIR, 'distribution_ledger.json');
+          let ledger = {};
+          try { ledger = JSON.parse(fs.readFileSync(LEDGER_FILE, 'utf8')); } catch { ledger = {}; }
+          const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex');
+          function saveLedger() { try { fs.writeFileSync(LEDGER_FILE, JSON.stringify(ledger, null, 2)); } catch (e) { console.error('ledger save failed', e.message); } }
+          function assertNotSentBefore(item, target) {
+            try { assertNotSentBeforeInner(item, target); } catch (e) { log(`🚫 BLOCKED (duplicate-content guard): ${e.message}`); throw e; }
+          }
+          function assertNotSentBeforeInner(item, target) {
+            // 1) item-level lock: an item that already has a Firebase record anywhere can never be sent again
+            if (item.distributed.length) {
+              const acct = item.distributed[0].dbName;
+              throw new Error(`${item.folder} is already in ${acct} (key ${item.distributed[0].key}). One image/set goes to ONE Zedge account only — sending it to ${target === acct ? 'the same account again' : target} would be duplicate content and can get the account suspended.`);
+            }
+            if (item.lockedAccount && item.lockedAccount !== target) throw new Error(`${item.folder} is locked to ${item.lockedAccount}.`);
+            // 2) file-level lock: byte-identical frames must never exist in two records / two R2 folders
+            for (const fr of item.frames) {
+              const h = sha256(fs.readFileSync(fr.localPath));
+              const hit = ledger[h];
+              if (hit) throw new Error(`${item.folder}/${fr.file} is byte-identical to a file already uploaded to ${hit.account} (${hit.folder}, key ${hit.firebaseKey}). Refused — duplicate content across Zedge accounts.`);
+            }
+          }
+          async function distributeItem(item, target, opts = {}) {
+            if (item.status !== 'done') throw new Error('item is not fully generated');
+            if (item.distributeStatus === 'running') return;
+            const resolved = item.lockedAccount && !item.distributed.length ? item.lockedAccount : resolveTarget(target);   // "spread" → one concrete account
+            const [{ name: onlyAccount }] = targetDbs(resolved);
+            assertNotSentBefore(item, onlyAccount);
+            if (String(target).toLowerCase() === SPREAD) log(`🔀 spread: ${item.folder} → ${onlyAccount}`);
+            const hasMeta = !!(item.meta && item.meta.title && item.meta.tags && item.meta.category);
+            if (state.settings.requireMetadata && !hasMeta && !opts.force) {
+              if (state.metaWorker.error && !state.metaWorker.running) throw new Error(`${item.folder}: Gemini worker stopped — ${state.metaWorker.error}. Press Edit and type title / tags / category, or re-export GEMINI_SESSION and start the workflow again.`);
+              if (item.metaStatus === 'queued' || item.metaStatus === 'running') throw new Error(`${item.folder}: Gemini metadata is still being written — the record is sent as soon as it is ready. (Or press Edit and type title / tags / category yourself.)`);
+              if (item.metaStatus === 'failed') throw new Error(`${item.folder}: metadata failed (${item.metaError || 'Gemini error'}). Press Redo or Edit it manually before distributing.`);
+              throw new Error(`${item.folder}: no metadata yet — ${state.metaWorker.available ? 'press 🧠 Generate metadata or Edit it manually' : 'GEMINI_SESSION is missing, so type title / tags / category with Edit'}. Records without metadata are skipped by the Zedge bot.`);
+            }
+            item.distributeStatus = 'running'; item.distributeError = ''; item.lockedAccount = onlyAccount; saveState();
+            const dbs = targetDbs(onlyAccount);      // always exactly one account
+            if (dbs.length !== 1 || FIREBASE_DB_MAP[dbs[0].name] !== dbs[0].url) throw new Error('internal: account routing mismatch — aborted');
+            const def = SET_FRAMES[item.type];
+            const [w, h] = RATIOS[item.settings.ratio] || RATIOS['9:16'];
+            const queuePath = state.settings.queuePath || 'wallpaperQueue';
+            let failures = [];
+            for (const db of dbs) {
+              try {
+                const files = {};
+                let first = null, totalSize = 0;
+                for (const fr of item.frames) {
+                  const buf = fs.readFileSync(fr.localPath);
+                  const name = `${slug(item.concept)}_${fr.file}`;
+                  const fileUrl = await uploadToR2(buf, name, db.name);   // R2 key = <db.name>/wallpaper/… — same account as the Firebase DB below
+                  if (!new RegExp(`/${db.name.replace(/^zedge_?/i, 'zedge')}/wallpaper/`, 'i').test(fileUrl) && !/localhost|127\.0\.0\.1/.test(fileUrl)) throw new Error(`R2 returned a URL outside the ${db.name} folder (${fileUrl}) — aborted before writing Firebase`);
+                  const entry = { fileUrl, name, size: buf.length, type: 'image/jpeg', width: w, height: h, sha256: sha256(buf) };
+                  files[fr.slot] = entry; totalSize += buf.length;
+                  if (!first) first = entry;
+                  log(`☁️ [${db.name}] R2 ← ${item.folder}/${fr.file}`);
+                }
+                const base = {
+                  name: first.name, type: 'image/jpeg', size: item.type === 'SINGLE' ? first.size : totalSize,
+                  width: w, height: h, isMp3: false, isImage: true,
+                  contentType: def.contentType,
+                  fileUrl: first.fileUrl,
+                  status: 'queued',
+                  prompt: item.prompt,
+                  imageModel: item.settings.model,
+                  source: 'github-image-studio',
+                  createdAt: Date.now()
+                };
+                if (item.type !== 'SINGLE') { base.files = files; base.setName = item.concept; }
+                // Ringtone-style: the record already carries title / tags / category / description / policyCheck,
+                // so the Zedge bot can upload it immediately (no "metadata missing" skip). Policy-held items are
+                // pushed as status:'failed' + policyCheck:'held' — visible in the app's Failed section, never auto-uploaded.
+                const mf = metaFields(item);
+                if (mf) Object.assign(base, mf);
+                const key = await firebasePush(db.url, queuePath, base);
+                for (const e of Object.values(files)) ledger[e.sha256] = { account: db.name, firebaseKey: key, folder: item.folder, file: e.name, at: Date.now() };
+                saveLedger();
+                const snap = mf ? { title: base.title, tags: base.tags, category: base.category, description: base.description, policyCheck: base.policyCheck, policyFlag: base.policyFlag, status: base.status, metadataGeneratedAt: base.metadataGeneratedAt, fetchedAt: Date.now() } : {};
+                item.distributed.push({ dbName: db.name, key, at: Date.now(), meta: snap });
+                log(`🔥 [${db.name}] Firebase key ${key} ← ${item.folder} (${def.contentType})${mf ? ` · "${base.title}" · ${base.category} · policy ${base.policyCheck}${base.status !== 'queued' ? ` · status ${base.status}` : ''}` : ' · ⚠️ NO metadata (bot will skip until the final metadata pass)'}`);
+                saveState();
+              } catch (e) {
+                failures.push(`${db.name}: ${e.message}`);
+                log(`❌ [${db.name}] distribute ${item.folder}: ${e.message}`);
+              }
+            }
+            item.distributeStatus = failures.length ? (item.distributed.length ? 'partial' : 'failed') : 'done';
+            item.distributeError = failures.join(' · ');
+            lastActivity = Date.now(); saveState();
+            if (failures.length) throw new Error(failures.join(' · '));
+          }
+          function maybeAutoDistribute(item) {
+            if (!state.settings.autoDistribute || item.status !== 'done' || item.distributed.length || item.distributeStatus === 'running') return;
+            const hasMeta = !!(item.meta && item.meta.title);
+            if (state.settings.requireMetadata && !hasMeta) {
+              if (state.metaWorker.available && state.settings.autoMetadata) return;          // will be called again when the result lands
+              log(`⏸ auto-distribute ${item.folder}: waiting for metadata (${state.metaWorker.available ? 'auto metadata is off — press 🧠' : 'GEMINI_SESSION missing — use Edit on the card'})`);
+              return;
+            }
+            if (hasMeta && item.meta.policyCheck === 'held') { if (!item.autoHeldNoted) { item.autoHeldNoted = true; log(`🛑 auto-distribute skipped for ${item.folder}: Zedge policy hold — ${item.meta.policyFlag}. Review it, then Distribute manually (it will be pushed as status failed/held) or fix the metadata with Edit.`); } return; }
+            distributeItem(item, state.settings.targetAccount).catch(e => log(`❌ auto-distribute ${item.folder}: ${e.message}`));
+          }
+
+          // ─── METADATA WORKER: image_metadata.mjs (Gemini Web) in local-jobs mode ────────────
+          // The workflow's own metadata script is started ONCE with META_LOCAL_DIR set. It opens Gemini
+          // Web, verifies the GEMINI_SESSION cookie and then watches META_DIR/jobs. For every finished
+          // set / image we drop a job file with the local anchor JPG; the script writes META_DIR/results/
+          // <id>.json with title / tags / category / description / policy verdict. Only then is the
+          // record pushed to Firebase (with the metadata in it) — the same order the ringtone job uses.
+          const META_JOBS = path.join(META_DIR, 'jobs'), META_RESULTS = path.join(META_DIR, 'results'), META_STOP = path.join(META_DIR, 'stop');
+          fs.mkdirSync(META_JOBS, { recursive: true }); fs.mkdirSync(META_RESULTS, { recursive: true });
+          try { fs.unlinkSync(META_STOP); } catch {}
+          for (const d of [META_JOBS, META_RESULTS]) for (const f of fs.readdirSync(d)) { try { fs.unlinkSync(path.join(d, f)); } catch {} }
+          let metaChild = null, metaRestartTimer = null;
+          const metaJobCount = () => { try { return fs.readdirSync(META_JOBS).filter(f => f.endsWith('.json')).length; } catch { return 0; } };
+
+          function queueMetadata(item, why = 'manual') {
+            const mw = state.metaWorker;
+            if (!mw.available) { if (why !== 'generated') log(`⚠️ Metadata unavailable: ${GEMINI_AVAILABLE ? 'image_metadata.mjs not found on the runner' : 'GEMINI_SESSION secret / gemini_session input is missing'} — edit metadata manually with Edit on the card`); return false; }
+            if (why === 'generated' && !state.settings.autoMetadata) return false;
+            const anchor = item.frames[0];
+            if (anchor.status !== 'done' || !anchor.localPath || !fs.existsSync(anchor.localPath)) { item.metaStatus = 'failed'; item.metaError = 'anchor image missing'; saveState(); return false; }
+            if (item.metaStatus === 'queued' || item.metaStatus === 'running') return true;
+            const job = { id: String(item.id), imagePath: anchor.localPath, kind: SET_FRAMES[item.type].contentType, folder: item.folder, queuedAt: Date.now() };
+            fs.writeFileSync(path.join(META_JOBS, `${item.id}.json`), JSON.stringify(job));
+            item.metaStatus = 'queued'; item.metaError = '';
+            mw.queued = metaJobCount();
+            log(`🧠 Metadata queued for ${item.folder} (${job.kind}) — ${why}`);
+            saveState();
+            ensureMetaWorker();
+            return true;
+          }
+          function ensureMetaWorker(why = 'jobs pending') {
+            const mw = state.metaWorker;
+            if (!mw.available || mw.running || state.finished) return;
+            if (mw.restarts >= 4) { mw.error = mw.error || 'metadata worker crashed 4× — check GEMINI_SESSION and the metadata log'; saveState(); return; }
+            mw.running = true; mw.ready = false; mw.startedAt = Date.now(); mw.current = 'opening Gemini Web…'; mw.error = ''; saveState();
+            log(`🧠 Starting Gemini-Web metadata worker (${why})`);
+            const env = { ...process.env, META_LOCAL_DIR: META_DIR, IMAGE_QUEUE_PATH: state.settings.queuePath || 'wallpaperQueue' };
+            metaChild = spawn(process.execPath, ['--experimental-vm-modules', METADATA_SCRIPT], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+            let buf = '', tail = [];
+            const onLine = line => {
+              const t = line.trim(); if (!t) return;
+              tail.push(t); if (tail.length > 40) tail.shift();
+              let m;
+              if (/READY_FOR_LOCAL_JOBS/.test(t)) { mw.ready = true; mw.current = 'idle — Gemini session verified'; log('🧠 Gemini Web session verified — metadata worker ready'); }
+              else if ((m = t.match(/\[local\] Key: (\S+) — (.+?) \(/))) { mw.current = `writing metadata · ${m[2]} #${m[1]}`; const it = state.items.find(i => String(i.id) === m[1]); if (it) { it.metaStatus = 'running'; saveState(); } }
+              else if (/Session FAILED|cookies are expired/i.test(t)) { mw.error = 'Gemini session expired / invalid — re-export GEMINI_SESSION'; }
+              else if (/Verifying session|Launching|storageState/i.test(t)) mw.current = 'opening Gemini Web…';
+              if (/✅ \[local\]|❌ \[local\]|🛑 \[local\]|🚫 \[local\]|❌ Session|Session FAILED|Failed to launch/.test(t)) log(`🧠 ${t.replace(/^\s+/, '')}`);
+            };
+            const onData = d => { buf += d.toString(); const parts = buf.split('\n'); buf = parts.pop(); parts.forEach(onLine); };
+            metaChild.stdout.on('data', onData); metaChild.stderr.on('data', onData);
+            metaChild.on('close', code => {
+              if (buf) onLine(buf); buf = '';
+              mw.running = false; mw.ready = false; mw.current = ''; metaChild = null;
+              mw.lastExit = { code, at: Date.now(), tail: tail.slice(-6) };
+              const pending = metaJobCount();
+              if (state.finished) return;
+              if (code !== 0) {
+                mw.restarts++;
+                log(`🧠 Metadata worker exited with code ${code} — ${tail.slice(-2).join(' | ').slice(0, 220)}`);
+                if (pending && mw.restarts < 4) { log(`🧠 ${pending} job(s) still pending — restarting the worker in 20 s (${mw.restarts}/3)`); clearTimeout(metaRestartTimer); metaRestartTimer = setTimeout(() => ensureMetaWorker('restart'), 20000); }
+                else if (pending) { mw.error = mw.error || `worker crashed ${mw.restarts}× — fix GEMINI_SESSION (see console) or edit metadata manually`; for (const it of state.items) if (it.metaStatus === 'queued' || it.metaStatus === 'running') { it.metaStatus = 'failed'; it.metaError = mw.error; } }
+              } else { log('🧠 Metadata worker stopped'); if (pending) { clearTimeout(metaRestartTimer); metaRestartTimer = setTimeout(() => ensureMetaWorker('jobs pending'), 3000); } }
+              saveState();
+            });
+            metaChild.on('error', e => { log(`❌ Metadata worker failed to start: ${e.message}`); mw.running = false; mw.error = e.message; metaChild = null; saveState(); });
+          }
+          function stopMetaWorker() {
+            try { fs.writeFileSync(META_STOP, String(Date.now())); } catch {}
+            if (metaChild) { const c = metaChild; setTimeout(() => { try { c.kill('SIGTERM'); } catch {} }, 4000); }
+          }
+          // Firebase fields carried by the record (push) or patched later. Mirrors image_metadata.mjs / the ringtone job.
+          function metaFields(item, forPatch = false) {
+            const m = item.meta; if (!m || !m.title) return null;
+            const at = m.generatedAt || Date.now();
+            const f = { title: m.title, tags: m.tags, category: m.category, description: m.description || '', metadataGeneratedAt: at, policyCheckedAt: at, metadataSource: m.source || 'gemini-web' };
+            if (m.policyCheck === 'held') {
+              Object.assign(f, { status: 'failed', policyCheck: 'held', policyFlag: m.policyFlag, failedAt: at,
+                error: `Zedge policy hold — ${m.policyFlag}. Review this item; Requeue only if it is your own original, policy-compliant work (uploading it may suspend the Zedge account).` });
+            } else {
+              f.policyCheck = 'passed';
+              if (forPatch) f.policyFlag = null;
+            }
+            return f;
+          }
+          async function patchDistributed(item, why) {
+            const queuePath = state.settings.queuePath || 'wallpaperQueue';
+            const f = metaFields(item, true); if (!f) return 0;
+            let n = 0;
+            for (const d of item.distributed) {
+              const dbUrl = FIREBASE_DB_MAP[d.dbName]; if (!dbUrl) continue;
+              const patch = { ...f };
+              // A record that was policy-held and is now approved by the user (manual Edit / clean regen) goes back to the upload queue.
+              if (f.policyCheck === 'passed' && d.meta && d.meta.policyCheck === 'held') Object.assign(patch, { status: 'queued', error: null, failedAt: null });
+              const res = await fetch(`${dbUrl}/${queuePath}/${d.key}.json`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).catch(e => { throw netErr('Firebase unreachable', e); });
+              if (!res.ok) throw new Error(`Firebase PATCH failed (${res.status}) on ${d.dbName}`);
+              d.meta = { ...(d.meta || {}), ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== null)), fetchedAt: Date.now() };
+              if (patch.status === 'queued') d.meta.status = 'queued';
+              for (const k of Object.keys(patch)) if (patch[k] === null) delete d.meta[k];
+              n++;
+              log(`📝 [${d.dbName}] ${d.key} metadata ${why} · "${f.title}" · ${f.category} · policy ${f.policyCheck}${patch.status ? ` · status ${patch.status}` : ''}`);
+            }
+            saveState();
+            return n;
+          }
+          function applyMetaResult(r) {
+            const item = state.items.find(i => String(i.id) === String(r.id));
+            const mw = state.metaWorker;
+            if (!item) return;
+            if (r.ok) {
+              item.meta = { title: String(r.title || '').trim(), tags: String(r.tags || '').trim(), category: VALID_IMG_CATS.includes(String(r.category || '').toUpperCase()) ? String(r.category).toUpperCase() : 'OTHER', description: String(r.description || '').trim(), policyCheck: r.policyCheck === 'held' ? 'held' : 'passed', policyFlag: r.policyFlag || '', generatedAt: r.finishedAt || Date.now(), source: 'gemini-web' };
+              if (!item.meta.title) { item.meta = null; item.metaStatus = 'failed'; item.metaError = 'Gemini returned an empty title'; mw.failed++; log(`❌ ${item.folder}: Gemini returned no title — Redo or edit manually`); }
+              else {
+                item.metaStatus = item.meta.policyCheck === 'held' ? 'held' : 'done'; item.metaError = '';
+                if (item.metaStatus === 'held') mw.held++; else mw.done++;
+                log(item.metaStatus === 'held' ? `🛑 ${item.folder}: policy hold — ${item.meta.policyFlag}` : `✅ ${item.folder}: metadata ready — "${item.meta.title}" · ${item.meta.category} · ${item.meta.tags.split(',').length} tags`);
+              }
+            } else { item.meta = null; item.metaStatus = 'failed'; item.metaError = r.error || 'unknown error'; mw.failed++; }
+            mw.queued = metaJobCount();
+            lastActivity = Date.now(); saveState();
+            if (item.distributed.length && item.meta) patchDistributed(item, 'updated').catch(e => log(`❌ ${item.folder}: ${e.message}`));
+            else maybeAutoDistribute(item);
+          }
+          setInterval(() => {
+            let files; try { files = fs.readdirSync(META_RESULTS).filter(f => f.endsWith('.json')); } catch { return; }
+            for (const f of files) {
+              const fp = path.join(META_RESULTS, f);
+              try { const r = JSON.parse(fs.readFileSync(fp, 'utf8')); fs.unlinkSync(fp); applyMetaResult(r); } catch (e) { try { fs.unlinkSync(fp); } catch {} log(`❌ bad metadata result ${f}: ${e.message}`); }
+            }
+            if (state.metaWorker.running && state.metaWorker.ready && !state.items.some(i => i.metaStatus === 'running')) state.metaWorker.current = metaJobCount() ? `${metaJobCount()} job(s) waiting` : 'idle — Gemini session verified';
+          }, 2000);
+
+          // Manual metadata from the panel (Edit). Same limits as the Gemini prompt / zedgeEnforce: title ≤25, 2–10 tags, category from the Zedge list.
+          function setManualMeta(item, b) {
+            const title = String(b.title || '').replace(/\s+/g, ' ').trim();
+            if (title.length < 3 || title.length > 25) throw new Error('Title must be 3–25 characters (Zedge limit).');
+            const tags = [...new Set(String(b.tags || '').toLowerCase().split(/[,\s]+/).map(t => t.trim()).filter(t => /^[a-z0-9-]{2,20}$/.test(t)))].slice(0, 10);
+            if (tags.length < 2) throw new Error('Give at least 2 tags (letters/numbers, comma separated).');
+            const category = String(b.category || '').toUpperCase().trim();
+            if (!VALID_IMG_CATS.includes(category)) throw new Error('Pick a category from the list.');
+            const description = String(b.description || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            if (/[#@]|https?:|www\./i.test(title + ' ' + description + ' ' + tags.join(' '))) throw new Error('No links, hashtags or @handles (Zedge policy).');
+            item.meta = { title, tags: tags.join(', '), category, description, policyCheck: 'passed', policyFlag: '', generatedAt: Date.now(), source: 'manual' };
+            item.metaStatus = 'manual'; item.metaError = ''; item.autoHeldNoted = false;
+            try { fs.unlinkSync(path.join(META_JOBS, `${item.id}.json`)); } catch {}
+            log(`📝 ${item.folder}: manual metadata saved — "${title}" · ${category}`);
+            saveState();
+          }
+          async function redoMetadata(item) {
+            if (!state.metaWorker.available) throw new Error('Gemini metadata is unavailable (GEMINI_SESSION missing) — edit it manually instead.');
+            item.meta = null; item.metaStatus = ''; item.metaError = ''; item.autoHeldNoted = false;
+            queueMetadata(item, 'redo');
+            return 1;
+          }
+          // Re-read status/metadata of distributed records so the panel shows what the bot did (uploaded / failed / requeued).
+          const META_FIELDS = ['title', 'tags', 'category', 'description', 'policyCheck', 'policyFlag', 'status', 'metadataGeneratedAt', 'error'];
+          let refreshing = false;
+          async function refreshFirebaseMeta(force = false) {
+            if (refreshing) return; refreshing = true;
+            try {
+              const queuePath = state.settings.queuePath || 'wallpaperQueue';
+              const jobs = [];
+              for (const item of state.items) for (const d of item.distributed) {
+                if (!force && d.meta && d.meta.fetchedAt && Date.now() - d.meta.fetchedAt < 55000) continue;
+                const dbUrl = FIREBASE_DB_MAP[d.dbName]; if (!dbUrl) continue;
+                jobs.push((async () => {
+                  try {
+                    const res = await fetch(`${dbUrl}/${queuePath}/${d.key}.json`);
+                    if (!res.ok) return;
+                    const rec = await res.json();
+                    if (!rec) { d.meta = { ...(d.meta || {}), missing: true, fetchedAt: Date.now() }; return; }
+                    const meta = {}; for (const f of META_FIELDS) if (rec[f] !== undefined && rec[f] !== null && rec[f] !== '') meta[f] = rec[f];
+                    meta.fetchedAt = Date.now();
+                    const before = d.meta && d.meta.status;
+                    d.meta = meta;
+                    if (before && meta.status && before !== meta.status) log(`📡 [${d.dbName}] ${d.key} status ${before} → ${meta.status}`);
+                  } catch {}
+                })());
+              }
+              if (jobs.length) { await Promise.all(jobs); saveState(); }
+            } finally { refreshing = false; }
+          }
+          setInterval(() => { if (!state.finished) refreshFirebaseMeta().catch(() => {}); }, 60000);
+
+          // ─── ZIP / METADATA EXPORT ─────────────────────────────────────────────────
+          function writeExports() {
+            const metadata = state.items.filter(i => i.frames.some(f => f.status === 'done')).map(i => ({
+              folder: i.folder, file: i.metadata.file,
+              title: i.meta ? i.meta.title : i.metadata.title, tags: i.meta ? i.meta.tags.split(/,\s*/) : i.metadata.tags, category: i.meta ? i.meta.category : i.metadata.category, description: i.meta ? i.meta.description : i.metadata.description,
+              metadataSource: i.meta ? i.meta.source : 'fallback-from-prompt', policyCheck: i.meta ? i.meta.policyCheck : '', policyFlag: i.meta ? i.meta.policyFlag : '',
+              type: i.type, contentType: SET_FRAMES[i.type].contentType, prompt: i.prompt, model: i.settings.model,
+              distributed: i.distributed.map(d => ({ dbName: d.dbName, key: d.key, at: d.at, firebase: d.meta && d.meta.title ? { title: d.meta.title, tags: d.meta.tags, category: d.meta.category, description: d.meta.description, policyCheck: d.meta.policyCheck, status: d.meta.status } : null }))
+            }));
+            fs.writeFileSync(path.join(OUT_DIR, 'metadata.json'), JSON.stringify(metadata, null, 2));
+            const pdir = path.join(OUT_DIR, 'prompts'); fs.mkdirSync(pdir, { recursive: true });
+            for (const i of state.items) fs.writeFileSync(path.join(pdir, `${i.folder}.txt`), [i.prompt, grading(i.settings), BASE_RULES].filter(Boolean).join('\n\n'));
+          }
+          function buildZip() {
+            writeExports();
+            const zipPath = '/tmp/zedge_upload.zip';
+            try { fs.unlinkSync(zipPath); } catch {}
+            execSync(`cd "${OUT_DIR}" && zip -q -r "${zipPath}" . -x "studio_state.json"`, { stdio: 'pipe' });
+            return zipPath;
+          }
+
+          // ─── FINISH ────────────────────────────────────────────────────────────────
+          function finish(reason) {
+            if (state.finished) return;
+            state.finished = true; state.finishReason = reason;
+            log(`🏁 Session finished: ${reason}`);
+            try { writeExports(); } catch {}
+            const generated = state.items.filter(i => i.status === 'done').length;
+            const frames = state.items.reduce((n, i) => n + i.frames.filter(f => f.status === 'done').length, 0);
+            const distributed = state.items.filter(i => i.distributed.length > 0).length;
+            const records = state.items.reduce((n, i) => n + i.distributed.length, 0);
+            stopMetaWorker();
+            const metaReady = state.items.reduce((n, i) => n + i.distributed.filter(d => d.meta && d.meta.title).length, 0);
+            const itemsWithMeta = state.items.filter(i => i.meta && i.meta.title).length;
+            const held = state.items.filter(i => i.meta && i.meta.policyCheck === 'held').length;
+            const perAccount = {};
+            for (const db of Object.keys(FIREBASE_DB_MAP)) perAccount[db] = state.items.filter(i => i.distributed.some(d => d.dbName === db)).length;
+            const manifest = state.items.map(i => ({ folder: i.folder, type: i.type, concept: i.concept, status: i.status, metadata: i.meta ? { title: i.meta.title, category: i.meta.category, tags: i.meta.tags, policy: i.meta.policyCheck, flag: i.meta.policyFlag || '', source: i.meta.source } : null, sentTo: i.distributed.map(d => ({ account: d.dbName, firebaseKey: d.key, at: new Date(d.at).toISOString(), title: d.meta && d.meta.title || '', category: d.meta && d.meta.category || '', policy: d.meta && d.meta.policyCheck || '', status: d.meta && d.meta.status || '' })) }));
+            const result = { reason, items: state.items.length, generated, frames, distributed, records, metaReady, metaMissing: records - metaReady, itemsWithMeta, held, perAccount, manifest, runMetadata: !!state.settings.runMetadata && records > metaReady, targetAccount: state.settings.targetAccount, queuePath: state.settings.queuePath };
+            fs.writeFileSync(RESULT_FILE, JSON.stringify(result, null, 2));
+            saveState();
+            setTimeout(() => process.exit(0), 1500);
+          }
+          setInterval(() => {
+            if (state.finished) return;
+            if (Date.now() >= deadline) return finish('session timeout reached');
+            const idleMin = parseInt(state.settings.autoFinishMinutes, 10) || 0;
+            if (idleMin > 0 && state.items.length) {
+              const busy = state.items.some(i => i.status === 'queued' || i.status === 'running' || i.distributeStatus === 'running');
+              const allDistributed = state.items.filter(i => i.status === 'done').every(i => i.distributed.length > 0);
+              if (!busy && (allDistributed || !state.settings.autoDistribute) && Date.now() - lastActivity > idleMin * 60000) {
+                return finish(`idle for ${idleMin} min after all work completed`);
+              }
+            }
+          }, 10000);
+
+          // ─── HTTP ──────────────────────────────────────────────────────────────────
+          const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
+          const readBody = req => new Promise((resolve, reject) => { let d = ''; req.on('data', c => { d += c; if (d.length > 5e6) req.destroy(); }); req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { reject(new Error('invalid JSON body')); } }); req.on('error', reject); });
+          function authed(req, url) {
+            const q = url.searchParams.get('k');
+            if (q && q === TOKEN) return 'query';
+            const m = (req.headers.cookie || '').match(/(?:^|;\s*)sk=([a-f0-9]+)/);
+            return m && m[1] === TOKEN ? 'cookie' : false;
+          }
+          function publicState() {
+            return {
+              ...state,
+              items: state.items.map(i => ({ ...i, frames: i.frames.map(f => ({ ...f, localPath: undefined, thumb: f.status === 'done' ? `/files/${encodeURIComponent(i.folder)}/${encodeURIComponent(f.file)}` : '' })) })),
+              creds: { ok: hasCreds(), cloud_name: creds.cloud_name, api_key: creds.api_key ? creds.api_key.slice(0, 4) + '…' : '' },
+              models: TEXT_MODELS, editModels: EDIT_MODELS, ratios: Object.keys(RATIOS), accounts: [...Object.keys(FIREBASE_DB_MAP), SPREAD], spreadCounts: spreadCounts().counts,
+              startedAt, deadline, now: Date.now(), inFlight,
+              totals: {
+                items: state.items.length,
+                frames: state.items.reduce((n, i) => n + i.frames.length, 0),
+                framesDone: state.items.reduce((n, i) => n + i.frames.filter(f => f.status === 'done').length, 0),
+                itemsDone: state.items.filter(i => i.status === 'done').length,
+                distributed: state.items.filter(i => i.distributed.length > 0).length,
+                records: state.items.reduce((n, i) => n + i.distributed.length, 0),
+                metaReady: state.items.reduce((n, i) => n + i.distributed.filter(d => d.meta && d.meta.title).length, 0),
+                metaItems: state.items.filter(i => i.meta && i.meta.title).length,
+                metaHeld: state.items.filter(i => i.meta && i.meta.policyCheck === 'held').length,
+                metaPending: state.items.filter(i => i.metaStatus === 'queued' || i.metaStatus === 'running').length,
+                metaNeeded: state.items.filter(i => i.status === 'done' && !(i.meta && i.meta.title)).length
+              },
+              categories: VALID_IMG_CATS,
+              geminiAvailable: GEMINI_AVAILABLE
+            };
+          }
+          function parsePrompts(body) {
+            const text = String(body.text || '').trim();
+            if (!text) throw new Error('Paste at least one prompt.');
+            const copies = Math.max(1, Math.min(10, parseInt(body.copies, 10) || 1));
+            const defType = TYPE_ALIAS[String(body.type || 'SINGLE').toUpperCase().replace(/[\s_]/g, '')] || 'SINGLE';
+            let items = null;
+            if (/^[\[{]/.test(text)) {
+              try { const j = JSON.parse(text); items = Array.isArray(j) ? j : Array.isArray(j.sets) ? j.sets : Array.isArray(j.prompts) ? j.prompts : [j]; } catch (e) { throw new Error('JSON could not be parsed: ' + e.message); }
+            }
+            if (!items) {
+              // one prompt per line; optional "TYPE | concept | prompt" shorthand
+              items = text.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+                const p = l.split('|').map(x => x.trim());
+                if (p.length >= 2 && TYPE_ALIAS[p[0].toUpperCase().replace(/[\s_]/g, '')]) return p.length === 2 ? { type: p[0], prompt: p[1] } : { type: p[0], concept: p[1], prompt: p.slice(2).join(' | ') };
+                return { prompt: l };
+              });
+            }
+            const out = [], problems = [];
+            items.forEach((it, i) => {
+              if (typeof it === 'string') it = { prompt: it };
+              if (!it || typeof it !== 'object') return problems.push(`#${i + 1}: not an object`);
+              const type = it.type || it.set ? TYPE_ALIAS[String(it.type || it.set).toUpperCase().replace(/[\s_]/g, '')] : defType;
+              const prompt = String(it.prompt || it.description || '').trim();
+              if (!type) return problems.push(`#${i + 1}: unknown type "${it.type || it.set}"`);
+              if (!prompt) return problems.push(`#${i + 1}: missing prompt`);
+              const settings = {};
+              if (it.model && TEXT_MODELS.includes(String(it.model))) settings.model = String(it.model);
+              if (['1K', '2K'].includes(String(it.res || it.resolution || '').toUpperCase())) settings.res = String(it.res || it.resolution).toUpperCase();
+              if (BOOST[String(it.boost || '').toLowerCase()]) settings.boost = String(it.boost).toLowerCase();
+              if (DISPLAY[String(it.display || '').toLowerCase()] !== undefined) settings.display = String(it.display).toLowerCase();
+              if (STRENGTH[String(it.strength || '').toLowerCase()]) settings.strength = String(it.strength).toLowerCase();
+              if (RATIOS[String(it.ratio || '')]) settings.ratio = String(it.ratio);
+              if (typeof it.upscale === 'boolean') settings.upscale = it.upscale;
+              const concept = String(it.concept || it.name || it.title || '').trim();
+              for (let c = 0; c < copies; c++) out.push({ type, prompt, concept: copies > 1 && concept ? `${concept} v${c + 1}` : concept, settings });
+            });
+            return { out, problems };
+          }
+
+          // Start the Gemini-Web worker right away: the session cookie is verified while the first images render,
+          // so an expired GEMINI_SESSION is visible in the panel within a minute instead of after the first set.
+          if (state.metaWorker.available && state.settings.autoMetadata) setTimeout(() => ensureMetaWorker('session start — verifying Gemini session'), 1500);
+
+          const server = http.createServer(async (req, res) => {
+            const url = new URL(req.url, `http://localhost:${PORT}`);
+            const p = url.pathname;
+            if (p === '/healthz') return json(res, 200, { ok: true, finished: state.finished });
+            if (p === '/logo.svg' || p === '/favicon.ico') { res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' }); return res.end(LOGO_SVG); }
+            const auth = authed(req, url);
+            if (!auth) {
+              res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+              return res.end('<!doctype html><body style="font-family:system-ui;background:#0b0f14;color:#eee;display:grid;place-items:center;height:100vh"><link rel="icon" type="image/svg+xml" href="/logo.svg"><div style="text-align:center"><img src="/logo.svg" alt="" style="width:72px;height:72px;border-radius:18px;display:block;margin:0 auto 14px"><h2>🔒 Image Studio</h2><p>Open the exact link printed in the GitHub Actions log (it contains <code>?k=…</code>).</p></div></body>');
+            }
+            try {
+              if (p === '/' || p === '/index.html') {
+                const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
+                if (auth === 'query') headers['Set-Cookie'] = `sk=${TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`;
+                res.writeHead(200, headers);
+                return res.end(PANEL_HTML);
+              }
+              if (p.startsWith('/files/')) {
+                const rel = decodeURIComponent(p.slice(7)).replace(/\.\./g, '');
+                const fp = path.join(OUT_DIR, rel);
+                if (!fp.startsWith(OUT_DIR) || !fs.existsSync(fp)) { res.writeHead(404); return res.end('not found'); }
+                res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=3600' });
+                return fs.createReadStream(fp).pipe(res);
+              }
+              if (p === '/api/state') return json(res, 200, publicState());
+              if (p === '/api/zip') {
+                const zp = buildZip();
+                res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="zedge_upload.zip"', 'Content-Length': fs.statSync(zp).size });
+                return fs.createReadStream(zp).pipe(res);
+              }
+              if (req.method !== 'POST') return json(res, 404, { error: 'not found' });
+              const body = await readBody(req);
+              lastActivity = Date.now();
+
+              if (p === '/api/settings') {
+                const s = body.settings || {};
+                if (s.model && TEXT_MODELS.includes(s.model)) state.settings.model = s.model;
+                if (['1K', '2K'].includes(s.res)) state.settings.res = s.res;
+                if (RATIOS[s.ratio]) state.settings.ratio = s.ratio;
+                if (BOOST[s.boost]) state.settings.boost = s.boost;
+                if (DISPLAY[s.display] !== undefined) state.settings.display = s.display;
+                if (STRENGTH[s.strength]) state.settings.strength = s.strength;
+                if (typeof s.upscale === 'boolean') state.settings.upscale = s.upscale;
+                if (s.concurrency) state.settings.concurrency = Math.max(1, Math.min(4, parseInt(s.concurrency, 10) || 1));
+                if (s.targetAccount && (FIREBASE_DB_MAP[s.targetAccount] || s.targetAccount === SPREAD)) state.settings.targetAccount = s.targetAccount;
+                if (Array.isArray(s.spreadPool)) { const pool = [...new Set(s.spreadPool.filter(a => FIREBASE_DB_MAP[a]))]; if (pool.length) state.settings.spreadPool = pool; }
+                if (typeof s.queuePath === 'string' && /^[A-Za-z0-9_\/-]{1,80}$/.test(s.queuePath.trim())) state.settings.queuePath = s.queuePath.trim();
+                if (typeof s.autoDistribute === 'boolean') state.settings.autoDistribute = s.autoDistribute;
+                if (typeof s.requireMetadata === 'boolean') state.settings.requireMetadata = s.requireMetadata;
+                if (typeof s.runMetadata === 'boolean') state.settings.runMetadata = s.runMetadata;
+                if (typeof s.autoMetadata === 'boolean') state.settings.autoMetadata = s.autoMetadata;
+                if (s.autoFinishMinutes !== undefined) state.settings.autoFinishMinutes = Math.max(0, Math.min(300, parseInt(s.autoFinishMinutes, 10) || 0));
+                const c = body.credentials || {};
+                if (c.cloud_name && c.api_key && c.api_secret) {
+                  if (!/^[A-Za-z0-9_-]{2,100}$/.test(String(c.cloud_name).trim())) throw new Error('Cloud name contains unsupported characters.');
+                  creds.cloud_name = String(c.cloud_name).trim(); creds.api_key = String(c.api_key).trim(); creds.api_secret = String(c.api_secret).trim();
+                  log('🔑 Cloudinary credentials updated from panel');
+                }
+                saveState(); pump();
+                if (state.settings.autoDistribute) state.items.forEach(maybeAutoDistribute);
+                if (state.settings.autoMetadata) for (const it of state.items) if (it.status === 'done' && !it.metaStatus) queueMetadata(it, 'generated');
+                return json(res, 200, { ok: true, settings: state.settings, creds: { ok: hasCreds() } });
+              }
+              if (p === '/api/prompts') {
+                const { out, problems } = parsePrompts(body);
+                if (!out.length) throw new Error(problems[0] || 'Nothing to add');
+                const startIndex = state.items.length;
+                out.forEach((o, i) => state.items.push(buildItem(o, startIndex + i + 1)));
+                const frames = out.reduce((n, o) => n + SET_FRAMES[o.type].frames.length, 0);
+                log(`📥 Added ${out.length} item(s) / ${frames} frame(s)${problems.length ? ` · ${problems.length} skipped` : ''}`);
+                saveState(); pump();
+                return json(res, 200, { ok: true, added: out.length, frames, problems, credsOk: hasCreds() });
+              }
+              if (p === '/api/retry') {
+                const item = state.items.find(i => i.id === body.id);
+                if (!item) throw new Error('item not found');
+                if (item.status === 'running') throw new Error('item is still running');
+                if (item.distributed.length || item.lockedAccount) throw new Error(`${item.folder} is already in ${item.distributed[0] ? item.distributed[0].dbName : item.lockedAccount} — frames cannot be regenerated after distribution (a new record would duplicate it). Add a new prompt instead.`);
+                const which = body.frame;
+                if (typeof which === 'number') {
+                  if (!item.frames[which]) throw new Error('frame not found');
+                  item.frames[which].status = 'queued';
+                  if (which === 0) { item.anchorId = null; item.frames.forEach((f, i) => { if (i > 0) f.status = 'queued'; }); }
+                  if (which === 0 && item.frames.length > 1) log(`⟳ ${item.folder}: anchor regenerated — all variants re-queued to stay consistent`);
+                } else {
+                  item.frames.forEach(f => { if (f.status !== 'done') f.status = 'queued'; });
+                  if (item.frames[0].status !== 'done') item.anchorId = null;
+                }
+                item.status = 'queued'; item.error = ''; item.distributed = []; item.distributeStatus = ''; item.distributeError = '';
+                if (item.frames[0].status !== 'done' && item.meta && item.meta.source !== 'manual') { item.meta = null; item.metaStatus = ''; item.metaError = ''; }
+                saveState(); pump();
+                return json(res, 200, { ok: true });
+              }
+              if (p === '/api/delete') {
+                const idx = state.items.findIndex(i => i.id === body.id);
+                if (idx < 0) throw new Error('item not found');
+                if (state.items[idx].status === 'running') throw new Error('item is still running');
+                const [it] = state.items.splice(idx, 1);
+                try { fs.rmSync(path.join(OUT_DIR, it.folder), { recursive: true, force: true }); } catch {}
+                saveState();
+                return json(res, 200, { ok: true });
+              }
+              if (p === '/api/pause') { state.paused = !!body.paused; log(state.paused ? '⏸ Queue paused' : '▶️ Queue resumed'); saveState(); pump(); return json(res, 200, { ok: true, paused: state.paused }); }
+              if (p === '/api/distribute') {
+                const target = String(body.target || state.settings.targetAccount).toLowerCase();
+                if (target !== SPREAD) targetDbs(target); else pickSpreadAccount(); // validate
+                let items = body.ids === 'all' ? state.items.filter(i => i.status === 'done') : state.items.filter(i => (body.ids || []).includes(i.id));
+                if (body.ids === 'all') items = items.filter(i => !i.distributed.length && !i.lockedAccount);
+                // Hard guard, synchronous so the panel gets the exact reason: never a second account / second send.
+                for (const it of items) if (it.status === 'done') assertNotSentBefore(it, target === SPREAD ? 'the next account' : targetDbs(target)[0].name);
+                let skipped = 0;
+                if (body.ids === 'all' && state.settings.requireMetadata && !body.force) { const ok = items.filter(i => i.meta && i.meta.title); skipped = items.length - ok.length; items = ok; }
+                if (!items.length) throw new Error(skipped ? `${skipped} item(s) have no metadata yet — wait for Gemini or use Edit (Zedge bot skips records without title/tags/category).` : 'Nothing to distribute (only fully generated, not-yet-distributed items are sent).');
+                // single item without metadata → let distributeItem throw its precise reason back to the panel
+                if (items.length === 1 && state.settings.requireMetadata && !body.force && !(items[0].meta && items[0].meta.title)) await distributeItem(items[0], target);
+                log(`🚀 Distributing ${items.length} item(s) → ${target}${skipped ? ` (${skipped} skipped: no metadata yet)` : ''}`);
+                (async () => { for (const it of items) { try { await distributeItem(it, target, { force: !!body.force }); } catch (e) { if (!/^\S+: (Gemini|metadata|no metadata)/.test(e.message)) log(`🚫 ${e.message}`); } } })();
+                return json(res, 200, { ok: true, count: items.length, skipped });
+              }
+              if (p === '/api/meta/run') {
+                if (!state.metaWorker.available) throw new Error(GEMINI_AVAILABLE ? 'image_metadata.mjs not found on the runner' : 'GEMINI_SESSION secret / gemini_session input is missing — type metadata manually with Edit');
+                let n = 0; for (const it of state.items) if (it.status === 'done' && !(it.meta && it.meta.title) && it.metaStatus !== 'queued' && it.metaStatus !== 'running') { if (queueMetadata(it, 'panel')) n++; }
+                if (!n) { state.metaWorker.restarts = 0; ensureMetaWorker('panel'); }
+                return json(res, 200, { ok: true, queued: n });
+              }
+              if (p === '/api/meta/refresh') { await refreshFirebaseMeta(true); return json(res, 200, { ok: true }); }
+              if (p === '/api/meta/redo') { const item = state.items.find(i => i.id === body.id); if (!item) throw new Error('item not found'); if (item.status !== 'done') throw new Error('item is not fully generated yet'); state.metaWorker.restarts = 0; const n = await redoMetadata(item); return json(res, 200, { ok: true, queued: n }); }
+              if (p === '/api/meta/set') {
+                const item = state.items.find(i => i.id === body.id); if (!item) throw new Error('item not found');
+                setManualMeta(item, body);
+                let patched = 0;
+                if (item.distributed.length) patched = await patchDistributed(item, 'set manually');
+                else maybeAutoDistribute(item);
+                return json(res, 200, { ok: true, patched, meta: item.meta });
+              }
+              if (p === '/api/finish') { json(res, 200, { ok: true }); return finish('finished from panel'); }
+              return json(res, 404, { error: 'not found' });
+            } catch (e) {
+              return json(res, 400, { error: e.message });
+            }
+          });
+
+          // ─── PANEL (single HTML page; polls /api/state) ────────────────────────────
+          // Brand logo (served at /logo.svg — favicon + panel icon; also used on the 401 page)
+          const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><path fill="#f5f4e8" d="M0 0h1024v1024H0z"/><path fill="#fe4102" d="M749.547 234.206c7.203-.797 16.731-.127 23.688 1.651a62.8 62.8 0 0 1 37.828 28.361c10.46 17.783 8.385 36.29 8.386 56.031l.017 50.469-.03 158.615-.02 140.609-.011 37.604c-.006 11.604.954 25.94-2.065 37.032-17.484 64.482-118.221 59.355-127.653-7.451-1.673-11.845-.747-28-.723-40.267l.153-58.906c.001-16.78 1.265-30.843-7.498-45.961a54.96 54.96 0 0 0-33.846-25.535c-13.786-3.524-50.501-2.578-64.707.272-28.207 5.659-49.278 29.949-56.365 57.391-2.349 12.084-2.007 25.808-2.248 38.156l-.907 48.032c-.124 10.159.253 22.803-1.987 32.51a58.8 58.8 0 0 1-11.613 23.95 63.56 63.56 0 0 1-42.665 22.964c-17.589 1.852-34.751-2.532-48.486-13.875a61.93 61.93 0 0 1-22.567-42.653c-.665-7.276-.111-17.591.03-25.159q.221-17.03.245-34.06c.349-67.503-.817-118.909 45.282-174.417 33.086-39.84 80.38-62.643 131.946-63.422 20.906-.315 42.737.833 63.553-.267 11.355-.601 24.366-5.902 32.846-13.634 21.158-19.293 19.975-37.268 19.983-62.748l-.011-42.638c.001-10.755-.598-26.029 1.746-36.179a58.5 58.5 0 0 1 12.004-24.36c12.135-14.356 27.325-20.568 45.695-22.115"/><path d="M304.965 233.706c17.092.193 32.223 4.016 45.067 15.744 21.139 19.302 19.942 35.578 21.111 61.08 1.175 25.661 5.881 66.171 25.801 83.712 7.713 6.791 16.95 9.605 27.305 8.861 40.524-2.911 44.31-62.445 48.011-93 1.22-10.075 1.054-21.55 3.647-31.478a55.9 55.9 0 0 1 11.463-21.941c23.442-27.466 66.903-30.825 94.19-7.331 19.416 16.715 20.192 34.448 21.976 57.972l2.446 31.628c2.14 26.223 4.968 53.9 6.607 79.998-31.962.462-56.299-1.685-87.843 6.778-53.461 14.345-88.497 45.502-115.955 92.064-3.629 6.644-6.916 12.637-9.702 19.711-26.756-.251-49.923 11.027-58.658 37.872-3.971 12.207-2.863 28.992-2.92 42.037l-.842 84.927c-.139 10.606.673 29.904-1.274 39.558a55.9 55.9 0 0 1-12.238 25.513 65.14 65.14 0 0 1-44.89 22.791c-17.866 1.44-37.473-3.375-51.287-15.162a61.62 61.62 0 0 1-21.546-42.126c-.561-7.683.65-19.383 1.294-27.404l3.588-42.827 13.355-158.036 11.678-141.16a4507 4507 0 0 1 4.233-50.199c1.775-21.384.924-40.949 16.51-58.015 13.512-14.795 29.226-20.345 48.873-21.567M602.396 581.24c17.51-.242 35.024-.174 52.532.204 2.704 35.764 7.372 71.431 10.1 107.272 2.178 28.609 8.843 57.157-12.849 80.78-13.508 14.711-28.634 19.882-48.201 20.937-16.97.331-34.989-5.692-47.605-17.059-4.895-4.409-18.166-19.346-18.073-25.94.109-7.683 1.033-16.768 1.167-24.692l1.182-59.846c.25-9.987.238-27.379 2.24-36.358a54.23 54.23 0 0 1 13.134-25.261c12.513-13.542 28.321-19.415 46.373-20.037"/></svg>`;
+
+          const PANEL_HTML = `<!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Image Studio · Runner Panel</title>
+          <link rel="icon" type="image/svg+xml" href="/logo.svg"><link rel="apple-touch-icon" href="/logo.svg">
+          <style>
+          :root{--bg:#0a0d13;--bg2:#0e1219;--surface:#131822;--raised:#1a2130;--line:rgba(255,255,255,.09);--line2:rgba(255,255,255,.16);--txt:#f3f5f9;--muted:rgba(255,255,255,.62);--faint:rgba(255,255,255,.4);
+          --acc:#6d8cff;--acc2:#38d6ff;--grad:linear-gradient(135deg,#6d8cff 0%,#38d6ff 100%);--ok:#3ecf8e;--warn:#f5b63d;--err:#ff6b6b;--violet:#a78bfa;--r:12px;--r2:8px}
+          *{box-sizing:border-box}html{scroll-behavior:smooth}
+          body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;
+          background-image:radial-gradient(1200px 600px at 10% -10%,rgba(109,140,255,.14),transparent 60%),radial-gradient(900px 500px at 100% 0%,rgba(56,214,255,.10),transparent 60%);background-attachment:fixed}
+          a{color:var(--acc2)}button{font:inherit}code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:rgba(255,255,255,.07);padding:1px 6px;border-radius:5px;color:#cfd6e4}
+          ::selection{background:rgba(109,140,255,.35)}
+          /* ─── header ─── */
+          .top{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);background:rgba(10,13,19,.72);border-bottom:1px solid var(--line)}
+          .top .in{max-width:1560px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+          .brand{display:flex;align-items:center;gap:12px;margin-right:auto}
+          .logo{width:38px;height:38px;border-radius:11px;background:#f2f1e6;display:grid;place-items:center;box-shadow:0 8px 24px rgba(255,69,0,.28),0 0 0 1px rgba(255,255,255,.08);position:relative;overflow:hidden}
+          .logo img{width:38px;height:38px;display:block;border-radius:11px}
+          .brand h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.01em;line-height:1.15}
+          .brand small{display:block;font-size:12px;color:var(--muted);font-weight:500}
+          .cloud{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);background:rgba(255,255,255,.05);border:1px solid var(--line);padding:4px 10px;border-radius:999px}
+          .cloud i{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(62,207,142,.18)}
+          .cloud.off i{background:var(--err);box-shadow:0 0 0 3px rgba(255,107,107,.18)}
+          .kpis{display:flex;gap:8px;flex-wrap:wrap}
+          .kpi{display:flex;align-items:center;gap:10px;padding:6px 12px 6px 8px;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:10px;min-width:118px}
+          .kpi .ring{width:34px;height:34px;flex:none}
+          .kpi .ring circle{fill:none;stroke-width:3.5}
+          .kpi .ring .bg{stroke:rgba(255,255,255,.08)}
+          .kpi .ring .fg{stroke:url(#g1);stroke-linecap:round;transition:stroke-dashoffset .6s ease}
+          .kpi .ring.t .fg{stroke:var(--warn)}
+          .kpi b{display:block;font-size:15px;line-height:1.1;letter-spacing:-.01em}
+          .kpi span{display:block;font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
+          .actions{display:flex;gap:8px}
+          .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:0 14px;border-radius:10px;border:1px solid transparent;cursor:pointer;font-weight:600;font-size:13px;transition:transform .12s ease,box-shadow .2s ease,background .2s;white-space:nowrap}
+          .btn:active{transform:translateY(1px)}.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+          .btn.pri{background:var(--grad);color:#0a0d13;box-shadow:0 6px 18px rgba(109,140,255,.35)}.btn.pri:hover{box-shadow:0 8px 26px rgba(109,140,255,.5)}
+          .btn.sec{background:rgba(255,255,255,.06);color:var(--txt);border-color:var(--line2)}.btn.sec:hover{background:rgba(255,255,255,.1)}
+          .btn.warn{background:rgba(245,182,61,.12);color:#ffd27a;border-color:rgba(245,182,61,.35)}.btn.warn:hover{background:rgba(245,182,61,.2)}
+          .btn.danger{background:rgba(255,107,107,.12);color:#ff9b9b;border-color:rgba(255,107,107,.3)}.btn.danger:hover{background:rgba(255,107,107,.2)}
+          .btn.sm{min-height:32px;padding:0 11px;font-size:12px;border-radius:8px}
+          .btn.icon{width:32px;padding:0}
+          .btn svg{width:15px;height:15px}
+          /* ─── layout ─── */
+          .wrap{max-width:1560px;margin:0 auto;padding:20px 24px 80px;display:grid;grid-template-columns:400px minmax(0,1fr);gap:20px;align-items:start}
+          @media(max-width:1040px){.wrap{grid-template-columns:1fr}.side{position:static!important}}
+          .side{position:sticky;top:78px;display:flex;flex-direction:column;gap:16px}
+          .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:0 1px 2px rgba(0,0,0,.2),0 12px 40px rgba(0,0,0,.25)}
+          /* ─── tabs ─── */
+          .tabs{display:flex;gap:4px;padding:6px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);border-radius:var(--r) var(--r) 0 0}
+          .tab{flex:1;min-height:38px;border:0;background:transparent;color:var(--muted);border-radius:8px;font-weight:600;font-size:12.5px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:.2s}
+          .tab:hover{color:var(--txt);background:rgba(255,255,255,.04)}.tab.on{color:var(--txt);background:var(--raised);box-shadow:inset 0 0 0 1px var(--line2)}
+          .tab .n{width:18px;height:18px;border-radius:6px;background:rgba(255,255,255,.08);display:grid;place-items:center;font-size:11px;color:var(--faint)}
+          .tab.on .n{background:var(--grad);color:#0a0d13}
+          .pane{display:none;padding:18px}.pane.on{display:block;animation:fade .25s ease}
+          @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+          .pane h3{margin:0 0 4px;font-size:15px;letter-spacing:-.01em}.pane p.lead{margin:0 0 14px;color:var(--muted);font-size:13px}
+          label.l{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin:12px 0 6px;font-weight:500}label.l:first-child{margin-top:0}
+          input,select,textarea{width:100%;background:var(--bg2);border:1px solid var(--line2);color:var(--txt);border-radius:var(--r2);padding:10px 12px;font:inherit;font-size:13.5px;min-height:42px;outline:none;transition:border-color .15s,box-shadow .15s}
+          input:focus,select:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(109,140,255,.22)}
+          select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 18px) 50%,calc(100% - 13px) 50%;background-size:5px 5px;background-repeat:no-repeat;padding-right:32px}
+          textarea{min-height:190px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55}
+          .g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+          .seg{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+          .seg input{display:none}.seg label{display:flex;flex-direction:column;align-items:center;gap:2px;padding:9px 6px;border:1px solid var(--line2);border-radius:var(--r2);cursor:pointer;font-size:12px;font-weight:600;color:var(--muted);background:var(--bg2);transition:.15s;text-align:center;min-height:52px;justify-content:center}
+          .seg label em{font-style:normal;font-size:10.5px;color:var(--faint);font-weight:500}
+          .seg input:checked+label{border-color:var(--acc);color:var(--txt);background:rgba(109,140,255,.12);box-shadow:0 0 0 1px var(--acc) inset}
+          .sw{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line);cursor:pointer;font-size:13px}
+          .sw:first-of-type{border-top:0}.sw span.t{flex:1}.sw span.t small{display:block;color:var(--faint);font-size:11.5px}
+          .sw input{display:none}.sw .k{width:38px;height:22px;border-radius:11px;background:rgba(255,255,255,.12);position:relative;transition:.2s;flex:none}
+          .sw .k::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.2s}
+          .sw input:checked+.k{background:var(--acc)}.sw input:checked+.k::after{left:19px}
+          .hint{font-size:12px;color:var(--faint);margin-top:8px;line-height:1.5}
+          .msg{font-size:12.5px;margin-top:10px;padding:9px 11px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--muted);display:none}
+          .msg.on{display:block}.msg.ok{border-color:rgba(62,207,142,.35);color:#9ef0c6;background:rgba(62,207,142,.08)}.msg.bad{border-color:rgba(255,107,107,.35);color:#ffb3b3;background:rgba(255,107,107,.08)}
+          .foot{display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap}
+          .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.chip{font-size:11.5px;padding:4px 9px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--muted);cursor:pointer}.chip:hover{color:var(--txt);border-color:var(--line2)}
+          /* ─── collection ─── */
+          .col-h{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+          .col-h h2{margin:0;font-size:16px;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+          .status{font-size:12px;color:var(--muted);font-weight:500;display:inline-flex;align-items:center;gap:6px}
+          .status i{width:8px;height:8px;border-radius:50%;background:var(--faint)}.status.run i{background:var(--warn);animation:pulse 1.2s infinite}.status.done i{background:var(--ok)}.status.paused i{background:var(--acc2)}
+          @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(245,182,61,.5)}70%{box-shadow:0 0 0 6px rgba(245,182,61,0)}}
+          .filters{display:flex;gap:4px;margin-left:auto;background:rgba(255,255,255,.04);padding:4px;border-radius:9px;border:1px solid var(--line)}
+          .filters button{border:0;background:transparent;color:var(--muted);font-size:12px;font-weight:600;padding:5px 10px;border-radius:6px;cursor:pointer}
+          .filters button.on{background:var(--raised);color:var(--txt)}.filters button b{color:var(--faint);font-weight:600;margin-left:4px}
+          .progress{height:4px;background:rgba(255,255,255,.06)}.progress i{display:block;height:100%;background:var(--grad);width:0;transition:width .5s ease;box-shadow:0 0 12px rgba(56,214,255,.6)}
+          .banner{margin:16px 18px 0;padding:14px 16px;border-radius:10px;border:1px solid rgba(245,182,61,.35);background:rgba(245,182,61,.08);color:#ffe0a3;font-size:13px;display:none}.banner.on{display:block}
+          .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px;padding:18px}
+          @media(max-width:560px){.grid{grid-template-columns:1fr;padding:12px}}
+          .item{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;position:relative;transition:border-color .2s,transform .2s;display:flex;flex-direction:column}
+          .item:hover{border-color:var(--line2)}
+          .item.running{border-color:rgba(245,182,61,.4)}.item.running::before{content:"";position:absolute;inset:-1px;border-radius:var(--r);padding:1px;background:linear-gradient(120deg,transparent 30%,rgba(245,182,61,.8),transparent 70%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:spin 2.2s linear infinite;pointer-events:none;background-size:300% 300%}
+          @keyframes spin{0%{background-position:0% 50%}100%{background-position:300% 50%}}
+          .item.failed,.item.partial{border-color:rgba(255,107,107,.35)}
+          .ih{display:flex;align-items:center;gap:10px;padding:12px 14px 10px}
+          .idx{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:12px;font-weight:700;background:rgba(255,255,255,.06);color:var(--muted);flex:none;font-variant-numeric:tabular-nums}
+          .ttl{flex:1;min-width:0}.ttl b{display:block;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.01em}
+          .ttl small{display:flex;gap:6px;align-items:center;color:var(--faint);font-size:11.5px;margin-top:2px;flex-wrap:wrap}
+          .type{font-size:10.5px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:5px;text-transform:uppercase}
+          .type.SINGLE{background:rgba(109,140,255,.16);color:#b4c4ff}.type.T24{background:rgba(245,182,61,.16);color:#ffd27a}.type.DUAL{background:rgba(167,139,250,.18);color:#d5c8ff}.type.BATTERY{background:rgba(62,207,142,.16);color:#9ef0c6}
+          .st{font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+          .st.queued{background:rgba(255,255,255,.07);color:var(--muted)}.st.running{background:rgba(245,182,61,.15);color:#ffd27a}.st.done{background:rgba(62,207,142,.15);color:#9ef0c6}.st.failed,.st.partial{background:rgba(255,107,107,.15);color:#ffb3b3}
+          .st.dist{background:rgba(56,214,255,.14);color:#9de9ff}
+          .sent{margin:10px 14px 0;padding:10px 12px;border-radius:9px;background:rgba(255,255,255,.03);border:1px dashed var(--line2);display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap}
+          .sent .lbl{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);padding-top:5px;min-width:56px}
+          .sent .none{font-size:12.5px;color:var(--faint);padding-top:3px}
+          .acct{display:inline-flex;flex-direction:column;gap:1px;padding:5px 9px;border-radius:7px;font-size:12px;font-weight:700;border:1px solid transparent;line-height:1.25}
+          .acct small{font-weight:500;font-size:10.5px;opacity:.75;font-family:ui-monospace,Menlo,Consolas,monospace}
+          .acct.z1{background:rgba(109,140,255,.16);color:#c3d0ff;border-color:rgba(109,140,255,.35)}
+          .acct.z2{background:rgba(62,207,142,.15);color:#a9f2d0;border-color:rgba(62,207,142,.35)}
+          .acct.z3{background:rgba(245,182,61,.15);color:#ffd98f;border-color:rgba(245,182,61,.35)}
+          .acct.z4{background:rgba(167,139,250,.18);color:#dccfff;border-color:rgba(167,139,250,.4)}
+          .acct.pending{background:transparent;color:var(--faint);border-style:dashed;border-color:var(--line2)}
+          .acct.err{background:rgba(255,107,107,.12);color:#ffb3b3;border-color:rgba(255,107,107,.35)}
+          .metab{margin:10px 14px 0;border-radius:9px;border:1px solid var(--line);background:rgba(255,255,255,.025);overflow:hidden}
+          .metab .mh{display:flex;align-items:center;gap:8px;padding:8px 12px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);border-bottom:1px solid var(--line)}
+          .metab .mh .sp{flex:1}.metab .mh button{min-height:26px;padding:0 9px;font-size:11px;border-radius:6px}.metab .mh button svg{width:12px;height:12px}
+          .mrow{display:grid;grid-template-columns:86px 1fr;gap:10px;padding:10px 12px;border-top:1px solid var(--line);align-items:start}.mrow:first-of-type{border-top:0}
+          .mrow .who{display:flex;flex-direction:column;gap:4px}.mrow .who .acct{padding:4px 7px;font-size:11.5px}
+          .mrow .who .pol{font-size:10.5px;font-weight:700;padding:2px 6px;border-radius:5px;text-align:center}
+          .pol.passed{background:rgba(62,207,142,.15);color:#9ef0c6}.pol.review{background:rgba(245,182,61,.15);color:#ffd27a}.pol.held{background:rgba(255,107,107,.15);color:#ffb3b3}.pol.wait{background:rgba(255,255,255,.06);color:var(--faint)}
+          .mrow .body{min-width:0}.mrow .body .t{font-size:13.5px;font-weight:700;color:var(--txt);display:flex;gap:8px;align-items:center;flex-wrap:wrap;letter-spacing:-.01em}
+          .mrow .body .t .cat{font-size:10.5px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:5px;background:rgba(56,214,255,.14);color:#9de9ff}
+          .mrow .body .d{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+          .mrow .body .d.open{display:block}
+          .tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}.tags span{font-size:11px;padding:2px 7px;border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line)}
+          .mrow .wait{font-size:12.5px;color:var(--faint);display:flex;align-items:center;gap:8px}.mrow .wait i{width:8px;height:8px;border-radius:50%;background:var(--warn);animation:pulse 1.2s infinite;display:inline-block}
+          .mrow .flag{font-size:11.5px;color:#ffb3b3;margin-top:4px}
+          .mw{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);background:rgba(255,255,255,.04);border:1px solid var(--line);padding:5px 10px;border-radius:999px;max-width:420px}
+          .mw i{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}.mw.run i{background:var(--violet);animation:pulse 1.2s infinite}.mw.off i{background:var(--err)}
+          .mw b{color:var(--txt);font-weight:600}.mw .cur{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+          .acctsum{display:flex;gap:6px;flex-wrap:wrap;padding:10px 18px 0;align-items:center}
+          .acctsum .lbl{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;font-weight:700;margin-right:2px}
+          .acctsum button{border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+          .acctsum button i{width:8px;height:8px;border-radius:50%;display:inline-block}
+          .acctsum button.z1 i{background:#6d8cff}.acctsum button.z2 i{background:#3ecf8e}.acctsum button.z3 i{background:#f5b63d}.acctsum button.z4 i{background:#a78bfa}
+          .acctsum button b{color:var(--txt)}.acctsum button.on{background:var(--raised);color:var(--txt);border-color:var(--line2)}
+          .acctsum button.none{opacity:.55}
+          .ring2{width:30px;height:30px;flex:none}.ring2 circle{fill:none;stroke-width:3}.ring2 .bg{stroke:rgba(255,255,255,.08)}.ring2 .fg{stroke:var(--ok);stroke-linecap:round;transition:stroke-dashoffset .5s}
+          .strip{display:grid;gap:6px;padding:0 14px;grid-template-columns:repeat(4,1fr)}
+          .strip[data-n="6"]{grid-template-columns:repeat(6,1fr)}
+          .strip .beside{grid-column:span 3;display:flex;flex-direction:column;gap:8px;min-width:0;padding:2px 0 2px 6px}
+          .strip[data-n="2"] .beside{grid-column:span 2}
+          .strip .beside .prompt{padding:0;-webkit-line-clamp:5}
+          .strip .beside .meta2{font-size:11.5px;color:var(--faint);display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}
+          .fr{position:relative;border-radius:8px;overflow:hidden;background:var(--surface);aspect-ratio:9/16;border:1px solid var(--line)}
+          .fr.sq{aspect-ratio:1}.fr.land{aspect-ratio:16/9}
+          .fr img{width:100%;height:100%;object-fit:cover;display:block;cursor:zoom-in;transition:transform .3s}.fr:hover img{transform:scale(1.04)}
+          .fr .cap{position:absolute;left:0;right:0;bottom:0;padding:14px 6px 5px;font-size:10px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.75));pointer-events:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .fr .ph{position:absolute;inset:0;display:grid;place-items:center;font-size:10.5px;color:var(--faint);text-align:center;padding:6px}
+          .fr.running .ph{color:#ffd27a}.fr.running::after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.07) 50%,transparent 70%);background-size:200% 100%;animation:shimmer 1.4s infinite}
+          @keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+          .fr.failed{border-color:rgba(255,107,107,.45)}.fr.failed .ph{color:#ffb3b3}
+          .fr .re{position:absolute;top:5px;right:5px;width:26px;height:26px;border-radius:7px;border:0;background:rgba(0,0,0,.6);color:#fff;cursor:pointer;display:grid;place-items:center;opacity:0;transition:.15s;backdrop-filter:blur(4px)}
+          .fr:hover .re,.fr.failed .re{opacity:1}.fr .re svg{width:13px;height:13px}
+          .prompt{padding:10px 14px 0;font-size:12.5px;color:var(--muted);line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}
+          .prompt.open{display:block}
+          .err{margin:8px 14px 0;font-size:12px;color:#ffb3b3;background:rgba(255,107,107,.08);border:1px solid rgba(255,107,107,.25);border-radius:7px;padding:7px 10px;word-break:break-word}
+          .if{display:flex;align-items:center;gap:8px;padding:12px 14px;margin-top:auto}
+          .if .meta{flex:1;display:flex;gap:6px;flex-wrap:wrap;font-size:11.5px;color:var(--faint)}
+          .if .meta code{font-size:11px}
+          .empty{padding:70px 24px;text-align:center;color:var(--muted)}
+          .empty .phones{display:flex;justify-content:center;gap:10px;margin-bottom:22px}
+          .empty .phones i{width:46px;height:82px;border-radius:10px;border:1px solid var(--line2);background:linear-gradient(160deg,rgba(109,140,255,.25),rgba(56,214,255,.05));position:relative;animation:float 4s ease-in-out infinite}
+          .empty .phones i:nth-child(2){animation-delay:.6s;background:linear-gradient(160deg,rgba(245,182,61,.3),rgba(255,107,107,.05))}.empty .phones i:nth-child(3){animation-delay:1.2s;background:linear-gradient(160deg,rgba(167,139,250,.3),rgba(56,214,255,.05))}.empty .phones i:nth-child(4){animation-delay:1.8s;background:linear-gradient(160deg,rgba(62,207,142,.3),rgba(109,140,255,.05))}
+          .empty .phones i::before{content:"";position:absolute;top:6px;left:50%;transform:translateX(-50%);width:14px;height:3px;border-radius:2px;background:rgba(255,255,255,.25)}
+          @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+          .empty h4{margin:0 0 6px;font-size:16px;color:var(--txt)}.empty p{margin:0;font-size:13px;max-width:420px;margin-inline:auto}
+          /* ─── console ─── */
+          .console{position:fixed;left:0;right:0;bottom:0;z-index:15;background:rgba(10,13,19,.92);backdrop-filter:blur(12px);border-top:1px solid var(--line2);transform:translateY(calc(100% - 40px));transition:transform .3s ease}
+          .console.open{transform:none}
+          .console .bar{height:40px;display:flex;align-items:center;gap:12px;padding:0 24px;cursor:pointer;user-select:none;font-size:12.5px;color:var(--muted)}
+          .console .bar b{color:var(--txt);font-weight:600}.console .bar .last{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--faint)}
+          .console .bar .dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
+          .console pre{margin:0;height:240px;overflow:auto;padding:6px 24px 16px;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#b9c2d3;white-space:pre-wrap}
+          .console pre .ok{color:#9ef0c6}.console pre .er{color:#ffb3b3}.console pre .wn{color:#ffd27a}.console pre .in{color:#9de9ff}.console pre .ts{color:var(--faint)}
+          /* ─── lightbox / toast ─── */
+          .lb{position:fixed;inset:0;z-index:50;background:rgba(5,7,10,.92);display:none;place-items:center;padding:24px;cursor:zoom-out}
+          .lb.on{display:grid;animation:fade .2s}.lb img{max-width:min(94vw,560px);max-height:92vh;border-radius:14px;box-shadow:0 30px 90px rgba(0,0,0,.7)}
+          .lb .cap{position:absolute;bottom:18px;left:0;right:0;text-align:center;color:var(--muted);font-size:13px}
+          .toasts{position:fixed;top:76px;right:24px;z-index:60;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+          .toast{background:var(--raised);border:1px solid var(--line2);color:var(--txt);padding:10px 14px;border-radius:10px;font-size:13px;box-shadow:0 12px 30px rgba(0,0,0,.4);animation:tin .25s ease;max-width:360px}
+          .toast.bad{border-color:rgba(255,107,107,.45)}.toast.good{border-color:rgba(62,207,142,.45)}
+          @keyframes tin{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
+          .done-banner{margin:16px 18px 0;padding:16px 18px;border-radius:12px;background:linear-gradient(135deg,rgba(62,207,142,.16),rgba(56,214,255,.1));border:1px solid rgba(62,207,142,.35);color:#d9fbe9;font-size:13.5px;display:none}.done-banner.on{display:block}
+          .done-banner b{display:block;font-size:15px;margin-bottom:4px;color:#fff}
+          @media(max-width:1500px){.brand small{display:none}.kpi{min-width:106px;padding:6px 10px 6px 8px}}
+          @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+          @media(max-width:640px){.top .in{padding:10px 14px;gap:10px}.wrap{padding:14px 14px 80px}.kpis{width:100%;order:3;display:grid;grid-template-columns:1fr 1fr;gap:8px}.kpi{min-width:0;padding:8px 10px}.kpi b{font-size:14px}.kpi span{font-size:10px;white-space:normal;line-height:1.2}.actions{margin-left:auto}.brand small{display:none}.console .bar,.console pre{padding-left:14px;padding-right:14px}.strip[data-n="6"]{grid-template-columns:repeat(3,1fr)}}
+          .mw.ok i{background:var(--ok)}.mw.err i{background:var(--err)}
+          .ms{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:5px;letter-spacing:.04em;text-transform:none;display:inline-flex;align-items:center;gap:5px}
+          .ms.done,.ms.manual{background:rgba(62,207,142,.15);color:#9ef0c6}.ms.held{background:rgba(255,107,107,.15);color:#ffb3b3}.ms.failed{background:rgba(255,107,107,.15);color:#ffb3b3}
+          .ms.queued,.ms.running{background:rgba(167,139,250,.16);color:#dccfff}.ms.none{background:rgba(255,255,255,.06);color:var(--faint)}
+          .ms i{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}.ms.running i{animation:pulse 1.2s infinite}
+          .mbody{padding:10px 12px}.mbody .t{font-size:14px;font-weight:700;color:var(--txt);display:flex;gap:8px;align-items:center;flex-wrap:wrap;letter-spacing:-.01em}
+          .mbody .t .cat{font-size:10.5px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:5px;background:rgba(56,214,255,.14);color:#9de9ff}
+          .mbody .d{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.45}.mbody .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.mbody .tags span{font-size:11px;padding:2px 7px;border-radius:5px;background:rgba(255,255,255,.06);color:var(--muted)}
+          .mbody .flag{font-size:12px;color:#ffb3b3;margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(255,107,107,.08);border:1px solid rgba(255,107,107,.25)}
+          .mbody .wait{font-size:12.5px;color:var(--faint);display:flex;align-items:center;gap:8px;line-height:1.4}.mbody .wait i{width:8px;height:8px;border-radius:50%;background:var(--violet);animation:pulse 1.2s infinite;display:inline-block;flex:none}
+          .mbody .src{font-size:11px;color:var(--faint);margin-top:6px}
+          .medit{display:grid;grid-template-columns:1fr 150px;gap:8px;padding:10px 12px}.medit label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--faint);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+          .medit input,.medit select,.medit textarea{background:rgba(255,255,255,.05);border:1px solid var(--line2);color:var(--txt);border-radius:7px;padding:7px 9px;font:inherit;font-size:13px;min-height:34px}.medit textarea{min-height:48px;resize:vertical}
+          .medit input:focus,.medit select:focus,.medit textarea:focus{outline:none;border-color:var(--acc)}.medit .full{grid-column:1/-1}.medit label{position:relative}.medit .cnt{position:absolute;right:2px;top:0;font-weight:400;text-transform:none;letter-spacing:0}
+          .medit .acts{grid-column:1/-1;display:flex;gap:8px;align-items:center;justify-content:flex-end}.medit .acts small{margin-right:auto;color:var(--faint);font-size:11.5px}
+          .acct small.fail{color:#ffb3b3}.acct small.up{color:#9ef0c6}
+          .btn.hold{background:rgba(255,107,107,.14);color:#ffb3b3;border:1px solid rgba(255,107,107,.35)}
+          .acctsum button.meta i{background:var(--violet)}.acctsum button.held i{background:var(--err)}
+          @media(max-width:640px){.medit{grid-template-columns:1fr}}
+          </style></head><body>
+          <svg width="0" height="0" style="position:absolute"><defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6d8cff"/><stop offset="1" stop-color="#38d6ff"/></linearGradient></defs></svg>
+          <header class="top"><div class="in">
+           <div class="brand"><div class="logo"><img src="/logo.svg" alt="logo"></div>
+            <div><h1>Image Studio <span class="cloud off" id="credPill"><i></i><span id="credTxt">no credentials</span></span></h1><small>Runs on the GitHub runner · exposed through Cloudflare tunnel</small></div></div>
+           <div class="kpis">
+            <div class="kpi"><svg class="ring" viewBox="0 0 36 36"><circle class="bg" cx="18" cy="18" r="15"/><circle class="fg" id="rFrames" cx="18" cy="18" r="15" stroke-dasharray="94.2" stroke-dashoffset="94.2"/></svg><div><b id="tFrames">0 / 0</b><span>frames</span></div></div>
+            <div class="kpi"><div style="width:34px;height:34px;border-radius:9px;background:rgba(109,140,255,.15);display:grid;place-items:center;color:#b4c4ff;font-weight:700;font-size:13px" id="tItems">0</div><div><b id="tItemsDone">0 done</b><span>items</span></div></div>
+            <div class="kpi"><div style="width:34px;height:34px;border-radius:9px;background:rgba(56,214,255,.14);display:grid;place-items:center"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9de9ff" stroke-width="2.2" stroke-linecap="round"><path d="M12 3c3 4 5 6.5 5 9.5a5 5 0 0 1-10 0c0-1.6.6-3 1.6-4.4.3 1.2 1 2 1.9 2.4C10.8 8.6 11.6 5.6 12 3z"/></svg></div><div><b id="tDist">0</b><span>distributed</span></div></div>
+            <div class="kpi"><svg class="ring" viewBox="0 0 36 36"><circle class="bg" cx="18" cy="18" r="15"/><circle class="fg" id="rMeta" cx="18" cy="18" r="15" stroke-dasharray="94.2" stroke-dashoffset="94.2" style="stroke:var(--violet)"/></svg><div><b id="tMeta">0 / 0</b><span>metadata</span></div></div>
+            <div class="kpi"><svg class="ring t" viewBox="0 0 36 36"><circle class="bg" cx="18" cy="18" r="15"/><circle class="fg" id="rTime" cx="18" cy="18" r="15" stroke-dasharray="94.2" stroke-dashoffset="0"/></svg><div><b id="tLeft">–</b><span>session left</span></div></div>
+           </div>
+           <div class="actions">
+            <button class="btn sec sm" id="pauseBtn" title="Pause / resume the generation queue"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg><span>Pause</span></button>
+            <a class="btn sec sm" href="/api/zip" title="Download everything generated so far"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>ZIP</a>
+            <button class="btn danger sm" id="finishBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 21V4"/><path d="M5 4h12l-2 4 2 4H5"/></svg>Finish session</button>
+           </div>
+          </div></header>
+
+          <main class="wrap">
+          <aside class="side">
+           <section class="card">
+            <nav class="tabs" role="tablist">
+             <button class="tab on" data-pane="pPrompts"><span class="n">1</span>Prompts</button>
+             <button class="tab" data-pane="pGen"><span class="n">2</span>Generate</button>
+             <button class="tab" data-pane="pDist"><span class="n">3</span>Distribute</button>
+             <button class="tab" data-pane="pCred"><span class="n">4</span>Keys</button>
+            </nav>
+            <div class="pane on" id="pPrompts">
+             <h3>Bulk prompts</h3><p class="lead">One prompt per line. Every line becomes a set or a single wallpaper and starts generating immediately.</p>
+             <label class="l">Set type for plain lines</label>
+             <div class="seg">
+              <input type="radio" name="ptype" id="ty1" value="SINGLE" checked><label for="ty1">Single<em>1 frame</em></label>
+              <input type="radio" name="ptype" id="ty2" value="24-HOUR"><label for="ty2">24‑Hour<em>4 frames</em></label>
+              <input type="radio" name="ptype" id="ty3" value="DUAL"><label for="ty3">Dual<em>lock + home</em></label>
+              <input type="radio" name="ptype" id="ty4" value="BATTERY"><label for="ty4">Battery<em>6 frames</em></label>
+             </div>
+             <label class="l"><span>Prompts</span><span id="lineCount">0 lines</span></label>
+             <textarea id="ptext" spellcheck="false" placeholder="Neon koi fish gliding through a glowing cyber pond, bioluminescent lilies
+          BATTERY | Crystal Heart | A floating crystal heart with veins of light
+          24H | Misty Peak | A lone mountain peak rising above a sea of clouds"></textarea>
+             <div class="chips"><span class="chip" data-ins="TYPE | concept | prompt">TYPE | concept | prompt</span><span class="chip" data-ins='[{"type":"24-HOUR","concept":"Misty Peak","prompt":"…","model":"flux-2-pro"}]'>JSON import</span><span class="chip" id="clearPrompts">Clear</span></div>
+             <div class="g2" style="margin-top:12px;align-items:end">
+              <div><label class="l">Copies per prompt</label><input id="copies" type="number" min="1" max="10" value="1"></div>
+              <button class="btn pri" id="addBtn" style="min-height:42px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Add &amp; generate</button>
+             </div>
+             <div class="msg" id="addMsg"></div>
+             <p class="hint">Shortcut: <kbd>Ctrl</kbd>+<kbd>Enter</kbd> adds the queue. Power cut? The runner keeps generating — just reopen this link.</p>
+            </div>
+            <div class="pane" id="pGen">
+             <h3>Generation defaults</h3><p class="lead">Applied to new items. JSON lines can override model, res, boost, display, strength, ratio, upscale.</p>
+             <label class="l">Model</label><select id="model"></select>
+             <div class="g3" style="margin-top:12px">
+              <div><label class="l">Resolution</label><select id="res"><option value="1K">1K · faster</option><option value="2K">2K · best</option></select></div>
+              <div><label class="l">Ratio <small>(single)</small></label><select id="ratio"></select></div>
+              <div><label class="l">Parallel</label><select id="concurrency"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
+             </div>
+             <div class="g3" style="margin-top:12px">
+              <div><label class="l">Color boost</label><select id="boost"><option value="off">Off · natural</option><option value="soft">Soft glow</option><option value="vivid">Vivid pop</option><option value="neon">Neon luxe</option><option value="ultra">Ultra impact</option></select></div>
+              <div><label class="l">Display</label><select id="display"><option value="any">Any phone</option><option value="amoled">AMOLED</option><option value="lcd">LCD</option></select></div>
+              <div><label class="l">Variation</label><select id="strength"><option value="subtle">Subtle</option><option value="clear">Clear</option><option value="strong">Strong</option></select></div>
+             </div>
+             <div style="margin-top:14px">
+              <label class="sw"><span class="t">AI upscale before crop<small><code>e_upscale</code> → 1620 × 2880 · slower but sharper</small></span><input type="checkbox" id="upscale"><span class="k"></span></label>
+             </div>
+             <div class="foot"><button class="btn pri" data-save>Save defaults</button><span class="hint" style="margin:0" id="saveMsg1"></span></div>
+            </div>
+            <div class="pane" id="pDist">
+             <h3>Distribution</h3><p class="lead">Completed items get Gemini‑Web metadata first, then are uploaded to R2 and queued in Firebase <b>with</b> title / tags / category — each item to exactly one account.</p>
+             <div class="g2"><div><label class="l">Target account</label><select id="target"></select></div><div><label class="l">Queue path</label><input id="queuePath"></div></div>
+             <div id="spreadBox" style="margin-top:8px;display:none"><label class="l">Spread across (each item → a different account, balanced)</label><div id="spreadPool" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px"></div></div>
+             <div class="hint" style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45">🔒 <b style="color:var(--txt)">One image / set → one Zedge account, always.</b> Choose <b>spread</b> to hand out a big batch: set 1 → zedge_1, set 2 → zedge_2, … (least-loaded account first) — every account gets <i>different</i> files, none gets a file that another account already has. Once distributed, an item is locked to that account (no re-send, no “all accounts”, no frame regeneration). A SHA‑256 ledger also refuses any byte‑identical file that was ever uploaded to any account. Want the same concept in another account? Add the prompt again — it renders a different image.</div>
+             <div style="margin-top:14px">
+              <label class="sw"><span class="t">Auto‑distribute<small>Send each item as soon as all of its frames are done</small></span><input type="checkbox" id="autoDistribute"><span class="k"></span></label>
+              <label class="sw"><span class="t">Gemini metadata before distribute<small>As soon as a set / image is rendered, Gemini Web writes title · tags · category · description + Zedge policy check (same script as <code>metadata</code> mode)</small></span><input type="checkbox" id="autoMetadata"><span class="k"></span></label>
+              <label class="sw"><span class="t">Require metadata to distribute<small>Records are pushed to Firebase <b>with</b> metadata, exactly like the ringtone job — the Zedge bot never sees a “metadata missing” file. Turn off only if you want the old behaviour (push first, patch later).</small></span><input type="checkbox" id="requireMetadata"><span class="k"></span></label>
+              <label class="sw"><span class="t">Final metadata pass after finish<small>Safety net: after the session the Firebase scan runs once for anything still missing title / tags / category</small></span><input type="checkbox" id="runMetadata"><span class="k"></span></label>
+             </div>
+             <label class="l"><span>Auto‑finish after idle</span><span>minutes · 0 = manual only</span></label><input id="autoFinish" type="number" min="0" max="300">
+             <p class="hint">Loadshedding mode: turn on auto‑distribute + an idle timer, paste prompts, and walk away. The session finishes itself and hands off to metadata.</p>
+             <div class="foot"><button class="btn pri" data-save>Save distribution</button><span class="hint" style="margin:0" id="saveMsg2"></span></div>
+            </div>
+            <div class="pane" id="pCred">
+             <h3>Cloudinary keys</h3><p class="lead" id="credHint"></p>
+             <label class="l">Cloud name</label><input id="c_cloud" autocomplete="off" placeholder="my-cloud">
+             <div class="g2" style="margin-top:12px"><div><label class="l">API key</label><input id="c_key" autocomplete="off" placeholder="1234567890"></div><div><label class="l">API secret</label><input id="c_secret" type="password" autocomplete="new-password" placeholder="••••••••"></div></div>
+             <p class="hint">Keys live only in this runner's memory for the session. Tip: add <code>CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET</code> repo secrets to skip this step.</p>
+             <div class="foot"><button class="btn pri" data-save>Save keys</button><span class="hint" style="margin:0" id="saveMsg3"></span></div>
+            </div>
+           </section>
+          </aside>
+
+          <section class="card" id="collection">
+           <div class="col-h">
+            <h2>Collection <span class="status" id="status"><i></i><span>idle</span></span></h2>
+            <div class="filters" id="filters"><button class="on" data-f="all">All<b id="fAll">0</b></button><button data-f="running">Active<b id="fRun">0</b></button><button data-f="done">Done<b id="fDone">0</b></button><button data-f="failed">Failed<b id="fFail">0</b></button><button data-f="dist">Sent<b id="fDist">0</b></button></div>
+            <button class="btn sec sm" id="distAllBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Distribute all completed</button>
+           </div>
+           <div class="progress"><i id="bar"></i></div>
+           <div class="acctsum" id="acctsum"></div>
+           <div class="acctsum" style="padding-top:8px"><span class="mw" id="mw"><i></i><span id="mwTxt">metadata worker idle</span></span><button class="btn sec sm" id="metaRunBtn" title="Queue every finished item that still has no metadata for Gemini Web">🧠 Generate metadata <b id="metaNeed" style="margin-left:4px"></b></button><button class="btn sec sm icon" id="metaRefreshBtn" title="Re-read record status from Firebase"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11A8 8 0 1 0 6.7 16.7"/><path d="M20 5v6h-6"/></svg></button></div>
+           <div class="done-banner" id="finishedBox"></div>
+           <div class="banner" id="credBanner">⚠ Add your Cloudinary keys in <b>Keys</b> — queued items start as soon as they are saved.</div>
+           <div class="grid" id="items"></div>
+           <div class="empty" id="empty"><div class="phones"><i></i><i></i><i></i><i></i></div><h4>Nothing in the collection yet</h4><p>Paste prompts on the left — singles, 24‑hour, dual or battery sets — and watch them render here frame by frame.</p></div>
+          </section>
+          </main>
+
+          <div class="console" id="console"><div class="bar" id="consoleBar"><span class="dot"></span><b>Console</b><span class="last" id="lastLog">waiting for the runner…</span><span id="consoleHint">▲ open</span></div><pre id="log"></pre></div>
+          <div class="lb" id="lb"><img id="lbImg" alt=""><div class="cap" id="lbCap"></div></div>
+          <div class="toasts" id="toasts"></div>
+
+          <script>
+          const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+          const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+          const RE='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11A8 8 0 1 0 6.7 16.7"/><path d="M20 5v6h-6"/></svg>';
+          const PEN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+          let S=null,inited=false,filter='all',openPrompts=new Set(),editId=null;
+          function toast(m,k){const t=document.createElement('div');t.className='toast'+(k?' '+k:'');t.textContent=m;$('#toasts').appendChild(t);setTimeout(()=>{t.style.opacity=0;t.style.transition='.3s';setTimeout(()=>t.remove(),300)},3200)}
+          async function api(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d}
+          const fmtLeft=ms=>{const h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000);return h?\`\${h}h \${String(m).padStart(2,'0')}m\`:\`\${m}m\`};
+          const ring=(el,frac)=>{el.style.strokeDashoffset=(94.2*(1-Math.max(0,Math.min(1,frac)))).toFixed(1)};
+          const typeCls=t=>t==='24-HOUR'?'T24':t;
+          const accts=()=>S?S.accounts.filter(a=>a!=='spread'):[];const acls=a=>'z'+String(a).replace(/\\D/g,'');
+          const fmtT=ms=>{const d=new Date(ms);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')};
+          const targetsOf=t=>[t];
+          function sentRow(i){
+           const cur=$('#target')?$('#target').value:S.settings.targetAccount;
+           const sentTo=new Set(i.distributed.map(d=>d.dbName));
+           if(!i.distributed.length&&i.distributeStatus!=='running'&&!i.distributeError) return \`<div class="sent"><span class="lbl">Sent to</span><span class="none">Not distributed yet\${i.status==='done'?\` · target: <b style="color:var(--txt)">\${cur==='spread'?'spread (next free account)':esc(cur)}</b>\`:''}</span></div>\`;
+           const badges=i.distributed.map(d=>{const st=d.meta&&d.meta.status||'';const cls=st==='failed'?' fail':st&&st!=='queued'?' up':'';return \`<span class="acct \${acls(d.dbName)}" title="Firebase key \${esc(d.key)} · \${new Date(d.at).toLocaleString()}\${d.meta&&d.meta.error?' · '+esc(d.meta.error):''}">\${esc(d.dbName)}<small class="\${cls.trim()}">\${esc(d.key)} · \${fmtT(d.at)}\${st?' · '+esc(st)+(d.meta.policyCheck==='held'?' (held)':''):''}</small></span>\`}).join('');
+           const pending=i.distributeStatus==='running'?targetsOf(i.lockedAccount||cur).filter(a=>!sentTo.has(a)&&a!=='spread').map(a=>\`<span class="acct pending">\${esc(a)}<small>uploading…</small></span>\`).join(''):'';
+           const failed=i.distributeError&&i.distributeStatus!=='running'?i.distributeError.split(' · ').map(x=>{const m=x.match(/^(zedge_\\d)/);return m&&!sentTo.has(m[1])?\`<span class="acct err" title="\${esc(x)}">\${esc(m[1])}<small>failed</small></span>\`:''}).join(''):'';
+           return \`<div class="sent"><span class="lbl">Sent to</span>\${badges}\${pending}\${failed}</div>\`}
+          const tagList=t=>Array.isArray(t)?t:String(t||'').split(/[,;]+/).map(x=>x.trim()).filter(Boolean);
+          const MS={queued:'queued for Gemini',running:'Gemini is writing…',done:'✓ Gemini Web',manual:'manual ✓',held:'🛑 policy hold',failed:'✗ failed'};
+          function metaBlock(i){
+           if(i.status!=='done') return '';
+           const mw=S.metaWorker,m=i.meta,st=i.metaStatus||(m?'done':'none');
+           const chip=\`<span class="ms \${st}">\${st==='running'||st==='queued'?'<i></i>':''}\${MS[st]||'no metadata'}</span>\`;
+           const canRedo=mw.available&&st!=='queued'&&st!=='running';
+           const head=\`<div class="mh">🧠 Zedge metadata \${chip}<span class="sp"></span>\${editId===i.id?'':\`<button class="btn sec sm" onclick="editMeta(\${i.id})" title="Type / fix title, tags, category yourself">\${PEN} Edit</button>\`}\${canRedo?\`<button class="btn sec sm" onclick="redoMeta(\${i.id})" title="Ask Gemini Web again\${i.distributed.length?' and patch every sent record':''}">\${RE} Redo</button>\`:''}</div>\`;
+           if(editId===i.id){const f=m||{title:i.metadata.title,tags:(i.metadata.tags||[]).join(', '),category:i.metadata.category,description:i.metadata.description};
+            return \`<div class="metab">\${head}<form class="medit" onsubmit="saveMeta(event,\${i.id})">
+             <label>Title <span class="cnt" id="ttlCnt\${i.id}">\${String(f.title||'').length}/25</span><input name="title" maxlength="25" value="\${esc(f.title)}" oninput="$('#ttlCnt\${i.id}').textContent=this.value.length+'/25'" required></label>
+             <label>Category<select name="category">\${S.categories.map(c=>\`<option\${c===f.category?' selected':''}>\${c}</option>\`).join('')}</select></label>
+             <label class="full">Tags (2–10, comma separated)<input name="tags" value="\${esc(tagList(f.tags).join(', '))}" required></label>
+             <label class="full">Description (max 5 words)<input name="description" maxlength="120" value="\${esc(f.description||'')}"></label>
+             <div class="acts"><small>\${i.distributed.length?\`Saving patches \${i.distributed.length} Firebase record(s)\${m&&m.policyCheck==='held'?' and re-queues the held item':''}\`:'Saved metadata is pushed together with the record'}</small><button type="button" class="btn sec sm" onclick="cancelEdit()">Cancel</button><button class="btn pri sm">Save metadata</button></div></form></div>\`}
+           let body;
+           if(m&&m.title) body=\`<div class="mbody"><div class="t">\${esc(m.title)}<span class="cat">\${esc(m.category)}</span></div>\${m.description?\`<div class="d">\${esc(m.description)}</div>\`:''}<div class="tags">\${tagList(m.tags).map(t=>\`<span>\${esc(t)}</span>\`).join('')}</div>\${m.policyFlag?\`<div class="flag">🛑 Zedge policy: \${esc(m.policyFlag)} — pushed as <b>status failed / held</b>; fix with Edit (re-queues) or Redo.</div>\`:''}</div>\`;
+           else if(st==='queued') body=\`<div class="mbody"><div class="wait"><i></i>\${mw.running&&mw.ready?'queued — Gemini is busy with another image':mw.running?'waiting — Gemini Web is opening…':mw.error?\`worker stopped: \${esc(mw.error)} · use Edit\`:'waiting for the metadata worker'}</div></div>\`;
+           else if(st==='running') body=\`<div class="mbody"><div class="wait"><i></i>Gemini Web is looking at this image and writing title · tags · category…</div></div>\`;
+           else if(st==='failed') body=\`<div class="mbody"><div class="flag">✗ \${esc(i.metaError||'metadata failed')} — press Redo or Edit.</div></div>\`;
+           else body=\`<div class="mbody"><div class="wait">\${!mw.available?'GEMINI_SESSION missing — type the metadata with Edit (records without it are skipped by the Zedge bot).':S.settings.autoMetadata?'no metadata yet — press 🧠 Generate metadata or Edit':'auto metadata is off — press 🧠 Generate metadata or Edit'}</div></div>\`;
+           return \`<div class="metab">\${head}\${body}</div>\`}
+          function distBtn(i){
+           const cur=$('#target')?$('#target').value:S.settings.targetAccount;
+           if(i.distributeStatus==='running') return \`<button class="btn sec sm" disabled>Distributing → \${esc(i.lockedAccount||cur)}…</button>\`;
+           const tl=cur==='spread'?'next account (spread)':cur;
+           if(i.distributed.length) return \`<button class="btn sec sm" disabled title="One image/set = one Zedge account. Locked to \${esc(i.distributed[0].dbName)} — it can never be sent to another account.">🔒 Only in \${esc(i.distributed[0].dbName)}</button>\`;
+           const hasMeta=!!(i.meta&&i.meta.title);
+           if(S.settings.requireMetadata&&!hasMeta) return \`<button class="btn sec sm" onclick="dist(\${i.id})" title="Records without title/tags/category are skipped by the Zedge bot — waiting for Gemini, or press Edit">⏳ Metadata first → \${esc(tl)}</button>\`;
+           if(hasMeta&&i.meta.policyCheck==='held') return \`<button class="btn hold sm" onclick="dist(\${i.id},true)" title="Pushed as status failed / policyCheck held — review in the app before requeue">🛑 Distribute held → \${esc(tl)}</button>\`;
+           return \`<button class="btn pri sm" onclick="dist(\${i.id})" title="Send to \${esc(tl)} only — this locks the item to that account">Distribute → \${esc(tl)}</button>\`}const fmtB=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':Math.round(b/1024)+' KB';
+          const setMsg=(el,txt,cls)=>{el.textContent=txt;el.className='msg on '+(cls||'')};
+
+          /* tabs */
+          $$('.tab').forEach(b=>b.onclick=()=>{$$('.tab').forEach(x=>x.classList.toggle('on',x===b));$$('.pane').forEach(p=>p.classList.toggle('on',p.id===b.dataset.pane))});
+          /* prompt helpers */
+          const lines=()=>$('#ptext').value.split('\\n').map(l=>l.trim()).filter(Boolean).length;
+          $('#ptext').addEventListener('input',()=>{$('#lineCount').textContent=lines()+' line'+(lines()===1?'':'s')});
+          $('#ptext').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();$('#addBtn').click()}});
+          $$('.chip[data-ins]').forEach(c=>c.onclick=()=>{const t=$('#ptext');t.value=(t.value.trim()?t.value.replace(/\\s*$/,'\\n'):'')+c.dataset.ins;t.dispatchEvent(new Event('input'));t.focus()});
+          $('#clearPrompts').onclick=()=>{$('#ptext').value='';$('#ptext').dispatchEvent(new Event('input'))};
+
+          function fillSettings(){const s=S.settings;
+           $('#model').innerHTML=S.models.map(m=>\`<option\${m===s.model?' selected':''}>\${m}</option>\`).join('');
+           $('#ratio').innerHTML=S.ratios.map(r=>\`<option\${r===s.ratio?' selected':''}>\${r}</option>\`).join('');
+           $('#target').innerHTML=S.accounts.map(a=>\`<option value="\${a}"\${a===s.targetAccount?' selected':''}>\${a==='spread'?'spread — each item to a different account':a}</option>\`).join('');
+           $('#spreadPool').innerHTML=accts().map(a=>\`<label class="chip" style="cursor:pointer;display:inline-flex;gap:6px;align-items:center"><input type="checkbox" class="sp" value="\${a}"\${(s.spreadPool||accts()).includes(a)?' checked':''}>\${a} <b style="color:var(--faint)">\${(S.spreadCounts||{})[a]??0}</b></label>\`).join('');$('#spreadBox').style.display=$('#target').value==='spread'?'':'none';
+           $('#res').value=s.res;$('#concurrency').value=s.concurrency;$('#boost').value=s.boost;$('#display').value=s.display;$('#strength').value=s.strength;$('#upscale').checked=s.upscale;
+           $('#queuePath').value=s.queuePath;$('#autoDistribute').checked=s.autoDistribute;$('#requireMetadata').checked=s.requireMetadata;$('#runMetadata').checked=s.runMetadata;$('#autoMetadata').checked=s.autoMetadata;$('#autoFinish').value=s.autoFinishMinutes;$('#c_cloud').value=S.creds.cloud_name||''}
+
+          function itemCard(i){
+           const done=i.frames.filter(f=>f.status==='done').length,n=i.frames.length;
+           const shape=i.type==='SINGLE'&&i.settings.ratio!=='9:16'?(i.settings.ratio==='1:1'?' sq':(i.settings.ratio==='16:9'||i.settings.ratio==='4:3')?' land':''):'';
+           const frames=i.frames.map((f,k)=>\`<div class="fr \${f.status}\${shape}" title="\${esc(f.name)}\${f.error?' — '+esc(f.error):''}">\${f.status==='done'?\`<img src="\${f.thumb}" loading="lazy" alt="\${esc(f.file)}" onclick="lb('\${f.thumb}','\${esc(i.folder)} · \${esc(f.file)}')">\`:\`<div class="ph">\${f.status==='running'?'rendering…':f.status==='failed'?'failed':'queued'}</div>\`}\${i.status!=='running'&&!i.distributed.length?\`<button class="re" title="Regenerate \${esc(f.name)}" onclick="retry(\${i.id},\${k})">\${RE}</button>\`:''}<div class="cap">\${esc(f.name)}</div></div>\`).join('');
+           const dist=i.distributed.length?\`<span class="st dist">🔒 \${esc(i.distributed[0].dbName)} only</span>\`:'';const mst=i.status==='done'&&i.meta&&i.meta.title?\`<span class="st dist" style="color:\${i.meta.policyCheck==='held'?'#ffb3b3':'#9ef0c6'}">\${i.meta.policyCheck==='held'?'🛑 held':'🧠 meta ✓'}</span>\`:'';
+           const busyDist='';
+           return \`<article class="item \${i.status}" data-id="\${i.id}">
+            <div class="ih"><div class="idx">\${String(i.index).padStart(2,'0')}</div><div class="ttl"><b title="\${esc(i.folder)}">\${esc(i.concept)}</b><small><span class="type \${typeCls(i.type)}">\${i.type}</span><span>\${esc(i.settings.model)}</span><span>· \${i.settings.res}\${i.type==='SINGLE'?' · '+i.settings.ratio:''}</span></small></div>
+             <svg class="ring2" viewBox="0 0 36 36" title="\${done}/\${n}"><circle class="bg" cx="18" cy="18" r="15"/><circle class="fg" cx="18" cy="18" r="15" stroke-dasharray="94.2" stroke-dashoffset="\${(94.2*(1-done/n)).toFixed(1)}" style="\${i.status==='failed'||i.status==='partial'?'stroke:var(--err)':i.status==='running'?'stroke:var(--warn)':''}"/></svg></div>
+            \${n<4?\`<div class="strip" data-n="\${n}">\${frames}<div class="beside"><div class="prompt \${openPrompts.has(i.id)?'open':''}" onclick="togglePrompt(\${i.id})">\${esc(i.prompt)}</div><div class="meta2"><span>\${n===1?'1 frame':n+' frames'}</span><span>· \${fmtB(i.frames.reduce((a,f)=>a+(f.size||0),0))}</span></div></div></div>\`
+            :\`<div class="strip" data-n="\${n}">\${frames}</div><div class="prompt \${openPrompts.has(i.id)?'open':''}" onclick="togglePrompt(\${i.id})">\${esc(i.prompt)}</div>\`}
+            \${i.error?\`<div class="err">\${esc(i.error)}</div>\`:''}\${i.distributeError&&i.distributeStatus!=='running'?\`<div class="err">Distribute · \${esc(i.distributeError)}</div>\`:''}
+            \${(i.status==='done'||i.distributed.length)?sentRow(i):''}
+            \${metaBlock(i)}
+            <div class="if"><div class="meta"><span class="st \${i.status}">\${i.status} · \${done}/\${n}</span>\${mst}\${dist}\${busyDist}</div>
+             \${i.status==='done'?distBtn(i):''}
+             \${(i.status==='failed'||i.status==='partial')?\`<button class="btn warn sm" onclick="retry(\${i.id})">\${RE}Retry failed</button>\`:''}
+             \${i.status!=='running'?\`<button class="btn sec sm icon" title="Remove" onclick="del(\${i.id})"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>\`:''}
+            </div></article>\`}
+
+          function render(){const s=S,t=s.totals;
+           $('#tFrames').textContent=\`\${t.framesDone} / \${t.frames}\`;ring($('#rFrames'),t.frames?t.framesDone/t.frames:0);
+           $('#tItems').textContent=t.items;$('#tItemsDone').textContent=\`\${t.itemsDone} done\`;$('#tDist').textContent=t.distributed;
+           const total=s.deadline-s.startedAt,left=Math.max(0,s.deadline-s.now);$('#tLeft').textContent=fmtLeft(left);ring($('#rTime'),left/total);
+           $('#bar').style.width=(t.frames?t.framesDone/t.frames*100:0)+'%';
+           $('#tMeta').textContent=\`\${t.metaItems} / \${t.itemsDone}\`;ring($('#rMeta'),t.itemsDone?t.metaItems/t.itemsDone:0);
+           const mw=s.metaWorker,mwEl=$('#mw');const busy=s.items.some(i=>i.metaStatus==='running');mwEl.className='mw '+(mw.error&&!mw.running?'err':mw.running&&busy?'run':mw.running&&mw.ready?'ok':mw.running?'run':mw.available?'':'off');
+           $('#mwTxt').innerHTML=!mw.available?\`<b>Gemini metadata unavailable</b> · \${s.geminiAvailable?'image_metadata.mjs missing':'GEMINI_SESSION not set'} — use Edit on each card\`:mw.running&&!mw.ready?\`<b>Gemini Web</b> <span class="cur">· \${esc(mw.current||'opening…')}</span>\`:mw.running?\`<b>Gemini Web \${busy?'writing':'ready'}</b> <span class="cur">· \${esc(mw.current||'idle')}</span>\${t.metaPending?\` · \${t.metaPending} pending\`:''} · ✅ \${mw.done} 🛑 \${mw.held} ❌ \${mw.failed}\`:mw.error?\`<b>Gemini worker stopped</b> · \${esc(mw.error)}\`:\`<b>Gemini worker idle</b>\${mw.lastExit?\` · exit \${mw.lastExit.code} at \${fmtT(mw.lastExit.at)}\`:''} · ✅ \${mw.done} 🛑 \${mw.held} ❌ \${mw.failed}\`;
+           $('#metaRunBtn').disabled=!mw.available||(!t.metaNeeded&&mw.running);$('#metaNeed').textContent=t.metaNeeded?t.metaNeeded:'';
+           $('#credPill').classList.toggle('off',!s.creds.ok);$('#credTxt').textContent=s.creds.ok?s.creds.cloud_name:'no credentials';
+           $('#credHint').textContent=s.creds.ok?\`Connected to cloud "\${s.creds.cloud_name}" (key \${s.creds.api_key}). Fill all three fields to replace.\`:'Add cloud name, API key and API secret from your Cloudinary console.';
+           $('#credBanner').classList.toggle('on',!s.creds.ok&&s.items.some(i=>i.status==='queued'));
+           $('#pauseBtn').querySelector('span').textContent=s.paused?'Resume':'Pause';$('#pauseBtn').classList.toggle('warn',s.paused);
+           const running=s.items.filter(i=>i.status==='running').length,queued=s.items.filter(i=>i.status==='queued').length,failed=s.items.filter(i=>i.status==='failed'||i.status==='partial').length;
+           const st=$('#status');st.className='status '+(s.finished?'done':running?'run':s.paused&&queued?'paused':t.items&&!queued?'done':'');
+           st.querySelector('span').textContent=s.finished?'finished':running?\`\${running} rendering · \${queued} queued\`:queued?(s.paused?\`paused · \${queued} queued\`:\`\${queued} queued\`):(t.items?'all done':'idle');
+           $('#fAll').textContent=t.items;$('#fRun').textContent=running+queued;$('#fDone').textContent=t.itemsDone;$('#fFail').textContent=failed;$('#fDist').textContent=t.distributed;
+           const fb=$('#finishedBox');fb.classList.toggle('on',s.finished);if(s.finished)fb.innerHTML=\`<b>Session finished — \${esc(s.finishReason)}</b>The workflow is moving on\${s.settings.runMetadata&&t.records>t.metaReady?' to the final Gemini‑Web metadata pass':''}. Everything generated is saved as the <code>image-studio-output</code> artifact.\`;
+           const list=s.items.filter(i=>filter==='all'||(filter==='running'&&(i.status==='running'||i.status==='queued'))||(filter==='done'&&i.status==='done')||(filter==='failed'&&(i.status==='failed'||i.status==='partial'))||(filter==='dist'&&i.distributed.length)||(filter==='unsent'&&i.status==='done'&&!i.distributed.length)||(filter==='nometa'&&i.status==='done'&&!(i.meta&&i.meta.title))||(filter==='held'&&i.meta&&i.meta.policyCheck==='held')||(filter.startsWith('acct:')&&i.distributed.some(d=>d.dbName===filter.slice(5))));
+           $('#empty').style.display=s.items.length?'none':'';$('#items').style.display=list.length?'':'none';
+           if(s.items.length&&!list.length){$('#empty').style.display='';$('#empty').querySelector('h4').textContent='Nothing matches this filter';$('#empty').querySelector('p').textContent='Try another filter above.'}
+           else if(!s.items.length){$('#empty').querySelector('h4').textContent='Nothing in the collection yet';$('#empty').querySelector('p').textContent='Paste prompts on the left — singles, 24‑hour, dual or battery sets — and watch them render here frame by frame.'}
+           if(editId!==null&&!s.items.some(i=>i.id===editId))editId=null;
+           if(editId===null){$('#items').innerHTML=list.map(itemCard).join('')}else{list.forEach(i=>{const el=$('#items').querySelector(\`[data-id="\${i.id}"]\`);if(!el){$('#items').insertAdjacentHTML('beforeend',itemCard(i));return}if(i.id===editId&&el.querySelector('.medit'))return;el.outerHTML=itemCard(i)})}
+           $('#acctsum').innerHTML='<span class="lbl">Sent per account</span>'+accts().map(a=>{const n=s.items.filter(i=>i.distributed.some(d=>d.dbName===a)).length;return \`<button class="\${acls(a)} \${filter==='acct:'+a?'on':''} \${n?'':'none'}" onclick="acctFilter('\${a}')"><i></i>\${a} <b>\${n}</b></button>\`}).join('')+(s.items.some(i=>i.status==='done'&&!i.distributed.length)?\`<button class="\${filter==='unsent'?'on':''}" onclick="acctFilter('unsent')">not sent <b>\${s.items.filter(i=>i.status==='done'&&!i.distributed.length).length}</b></button>\`:'')+(t.metaNeeded?\`<button class="meta \${filter==='nometa'?'on':''}" onclick="acctFilter('nometa')"><i></i>needs metadata <b>\${t.metaNeeded}</b></button>\`:'')+(t.metaHeld?\`<button class="held \${filter==='held'?'on':''}" onclick="acctFilter('held')"><i></i>policy hold <b>\${t.metaHeld}</b></button>\`:'');
+           const lg=$('#log');const atBottom=lg.scrollHeight-lg.scrollTop-lg.clientHeight<40;
+           lg.innerHTML=s.log.slice(-200).map(l=>{const m=l.match(/^(\\[[^\\]]+\\])\\s?(.*)$/);const body=m?m[2]:l;const cls=/✅|🔥|🏁/.test(body)?'ok':/❌|✖/.test(body)?'er':/⚠️|⟳|⏸/.test(body)?'wn':/🎨|📥|☁️|🚀|🔑|▶️/.test(body)?'in':'';return \`<span class="ts">\${esc(m?m[1]:'')}</span> <span class="\${cls}">\${esc(body)}</span>\`}).join('\\n');
+           if(atBottom)lg.scrollTop=lg.scrollHeight;$('#lastLog').textContent=s.log.length?s.log[s.log.length-1].replace(/^\\[[^\\]]+\\]\\s?/,''):'waiting for the runner…'}
+
+          async function poll(){try{const r=await fetch('/api/state',{cache:'no-store'});if(r.status===401){location.reload();return}S=await r.json();if(!inited){fillSettings();inited=true}render()}catch(e){$('#status').className='status';$('#status').querySelector('span').textContent='reconnecting…'}}
+          window.redoMeta=async id=>{const i=S.items.find(x=>x.id===id);if(i&&i.meta&&!confirm(\`Ask Gemini Web again for this \${i.type==='SINGLE'?'image':'set'}?\${i.distributed.length?\`\\nThe new metadata will be patched on \${i.distributed.length} sent record(s).\`:''}\`))return;try{await api('/api/meta/redo',{id});toast('Queued for Gemini Web','good')}catch(e){toast(e.message,'bad')}poll()};
+          window.editMeta=id=>{editId=id;render()};window.cancelEdit=()=>{editId=null;render()};
+          window.saveMeta=async(ev,id)=>{ev.preventDefault();const f=new FormData(ev.target);try{const r=await api('/api/meta/set',{id,title:f.get('title'),tags:f.get('tags'),category:f.get('category'),description:f.get('description')});editId=null;toast(r.patched?\`Metadata saved · \${r.patched} Firebase record(s) patched\`:'Metadata saved','good')}catch(e){toast(e.message,'bad')}poll()};
+          $('#metaRunBtn').onclick=async()=>{try{const r=await api('/api/meta/run');toast(r.queued?\`\${r.queued} item(s) queued for Gemini Web\`:'Gemini worker (re)started','good')}catch(e){toast(e.message,'bad')}poll()};
+          $('#metaRefreshBtn').onclick=async()=>{try{await api('/api/meta/refresh');toast('Record status refreshed from Firebase')}catch(e){toast(e.message,'bad')}poll()};
+          window.acctFilter=a=>{const f=(a==='unsent'||a==='nometa'||a==='held')?a:'acct:'+a;filter=filter===f?'all':f;$$('#filters button').forEach(x=>x.classList.toggle('on',x.dataset.f===(filter==='all'?'all':'')));render()};
+          window.togglePrompt=id=>{openPrompts.has(id)?openPrompts.delete(id):openPrompts.add(id);render()};
+          window.lb=(src,cap)=>{$('#lbImg').src=src;$('#lbCap').textContent=cap;$('#lb').classList.add('on')};$('#lb').onclick=()=>$('#lb').classList.remove('on');document.addEventListener('keydown',e=>{if(e.key==='Escape')$('#lb').classList.remove('on')});
+          window.retry=async(id,frame)=>{try{await api('/api/retry',{id,frame});toast(frame===undefined?'Re-queued failed frames':'Frame re-queued')}catch(e){toast(e.message,'bad')}poll()};
+          window.del=async id=>{if(!confirm('Remove this item and its files?'))return;try{await api('/api/delete',{id})}catch(e){toast(e.message,'bad')}poll()};
+          window.dist=async(id,held)=>{if(held&&!confirm('This item is on Zedge policy hold. It will be pushed as status FAILED / policyCheck HELD (visible in the app\\'s Failed section, not uploaded). Continue?'))return;try{const r=await api('/api/distribute',{ids:[id],target:$('#target').value});toast(\`Distributing \${r.count} item → \${$('#target').value}\`,'good')}catch(e){toast(e.message,'bad')}poll()};
+          $('#distAllBtn').onclick=async()=>{try{const r=await api('/api/distribute',{ids:'all',target:$('#target').value});toast(\`Distributing \${r.count} item(s) → \${$('#target').value}\${r.skipped?\` · \${r.skipped} waiting for metadata\`:''}\`,'good')}catch(e){toast(e.message,'bad')}poll()};
+          $('#pauseBtn').onclick=async()=>{await api('/api/pause',{paused:!S.paused});poll()};
+          document.addEventListener('change',e=>{if(e.target&&e.target.id==='target'&&S){$('#spreadBox').style.display=e.target.value==='spread'?'':'none';render()}});
+          $$('#filters button').forEach(b=>b.onclick=()=>{filter=b.dataset.f;$$('#filters button').forEach(x=>x.classList.toggle('on',x===b));render()});
+          $('#consoleBar').onclick=()=>{const c=$('#console');c.classList.toggle('open');$('#consoleHint').textContent=c.classList.contains('open')?'▼ close':'▲ open';if(c.classList.contains('open')){const lg=$('#log');lg.scrollTop=lg.scrollHeight}};
+          $('#finishBtn').onclick=async()=>{const nd=S.items.filter(i=>i.status==='done'&&!i.distributed.length).length,busy=S.items.filter(i=>i.status==='running'||i.status==='queued').length;
+           if(!confirm(\`Finish the session?\${busy?\`\\n• \${busy} item(s) still queued/rendering will be abandoned.\`:''}\${nd?\`\\n• \${nd} completed item(s) are NOT distributed (they stay in the ZIP artifact).\`:''}\${S.settings.runMetadata&&S.totals.records>S.totals.metaReady?'\\n• The final Gemini‑Web metadata pass runs next for records still missing metadata.':''}\`))return;await api('/api/finish');toast('Finishing session…');poll()};
+          $$('[data-save]').forEach(b=>b.onclick=async()=>{const pane=b.closest('.pane'),msgEl=pane.querySelector('[id^=saveMsg]');try{
+           const settings={model:$('#model').value,res:$('#res').value,ratio:$('#ratio').value,boost:$('#boost').value,display:$('#display').value,strength:$('#strength').value,upscale:$('#upscale').checked,concurrency:$('#concurrency').value,targetAccount:$('#target').value,spreadPool:$$('#spreadPool .sp:checked').map(x=>x.value),queuePath:$('#queuePath').value,autoDistribute:$('#autoDistribute').checked,requireMetadata:$('#requireMetadata').checked,runMetadata:$('#runMetadata').checked,autoMetadata:$('#autoMetadata').checked,autoFinishMinutes:$('#autoFinish').value};
+           const credentials={cloud_name:$('#c_cloud').value.trim(),api_key:$('#c_key').value.trim(),api_secret:$('#c_secret').value.trim()};
+           const r=await api('/api/settings',{settings,credentials});msgEl.textContent='Saved ✓'+(r.creds.ok?'':' · keys still missing');$('#c_key').value='';$('#c_secret').value='';toast('Settings saved','good')}catch(e){msgEl.textContent=e.message;toast(e.message,'bad')}poll()});
+          $('#addBtn').onclick=async()=>{const m=$('#addMsg');try{$('#addBtn').disabled=true;const r=await api('/api/prompts',{text:$('#ptext').value,type:document.querySelector('input[name=ptype]:checked').value,copies:$('#copies').value});
+           setMsg(m,\`Queued \${r.added} item(s) · \${r.frames} frame(s)\${r.problems.length?' · skipped: '+r.problems.join('; '):''}\${r.credsOk?'':' — add Cloudinary keys to start'}\`,r.credsOk?'ok':'bad');$('#ptext').value='';$('#ptext').dispatchEvent(new Event('input'));toast(\`Queued \${r.added} item(s)\`,'good');if(!r.credsOk){$$('.tab')[3].click()}}catch(e){setMsg(m,e.message,'bad');toast(e.message,'bad')}finally{$('#addBtn').disabled=false}poll()};
+          poll();setInterval(poll,2500);
+          </script></body></html>
+
+          `;
+
+          server.listen(PORT, () => {
+            log(`🖥️  Image Studio listening on http://localhost:${PORT}/?k=${TOKEN}`);
+            log(`⏱️  Session deadline: ${new Date(deadline).toISOString()} (${TIMEOUT_MIN} min)`);
+            log(hasCreds() ? `🔑 Cloudinary cloud: ${creds.cloud_name}` : '⚠️  No Cloudinary credentials yet — add them in the panel (or CLOUDINARY_* secrets).');
+            log(state.metaWorker.available ? `🧠 Gemini-Web metadata worker ready (${path.basename(METADATA_SCRIPT)})` : `⚠️  Metadata worker unavailable: ${GEMINI_AVAILABLE ? 'image_metadata.mjs missing' : 'GEMINI_SESSION not set'} — metadata will not be generated in-session`);
+            saveState();
+          });
+          process.on('SIGTERM', () => finish('runner stopped'));
+          process.on('SIGINT', () => finish('interrupted'));
+          STUDIO_EOF
+          node --check studio_server.mjs && echo "✅ studio_server.mjs OK ($(wc -l < studio_server.mjs) lines)"
+
+
+      - name: 🚀 Start Image Studio + Cloudflare tunnel
+        if: github.event.inputs.mode == 'image_studio'
+        id: tunnel
+        env:
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          CLOUDINARY_URL: ${{ secrets.CLOUDINARY_URL }}
+          TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
+          IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
+          STUDIO_TIMEOUT_MINUTES: ${{ github.event.inputs.studio_timeout_minutes }}
+          STUDIO_AUTO_METADATA: ${{ github.event.inputs.studio_auto_metadata }}
+          GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
+          GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
+          METADATA_SCRIPT: ${{ github.workspace }}/image_metadata.mjs
+          STUDIO_META_DIR: /tmp/studio_meta
+          STUDIO_OUT_DIR: /tmp/studio_out
+          STUDIO_RESULT_FILE: /tmp/studio_result.json
+        run: |
+          # Random access token — the tunnel URL is public, the panel only opens with ?k=TOKEN
+          STUDIO_TOKEN="$(openssl rand -hex 12)"
+          export STUDIO_TOKEN
+          mkdir -p /tmp/studio_out
+
+          nohup node studio_server.mjs > /tmp/studio_server.log 2>&1 &
+          echo $! > /tmp/studio_server.pid
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8787/healthz > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8787/healthz > /dev/null || { echo "❌ Studio server did not start"; cat /tmp/studio_server.log; exit 1; }
+          echo "✅ Studio server up (pid $(cat /tmp/studio_server.pid))"
+          [ -f image_metadata.mjs ] && echo "🧠 image_metadata.mjs present — Gemini-Web metadata runs BEFORE every distribute" || echo "⚠️ image_metadata.mjs missing — in-session metadata disabled"
+
+          nohup cloudflared tunnel --url http://localhost:8787 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          TUNNEL_URL=""
+          for i in $(seq 1 90); do
+            TUNNEL_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1 || true)"
+            [ -n "$TUNNEL_URL" ] && break
+            sleep 1
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Could not obtain a trycloudflare.com URL"; cat /tmp/cloudflared.log; exit 1
+          fi
+          PANEL_URL="${TUNNEL_URL}/?k=${STUDIO_TOKEN}"
+          echo "$PANEL_URL" > /tmp/studio_url.txt
+          echo "panel_url=$PANEL_URL" >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "══════════════════════════════════════════════════════════════════════"
+          echo "  🎨  IMAGE STUDIO PANEL IS LIVE"
+          echo ""
+          echo "  👉  $PANEL_URL"
+          echo ""
+          echo "  ⏱️  Session length: ${STUDIO_TIMEOUT_MINUTES:-240} min (press 'Finish session' in the panel when done)"
+          echo "══════════════════════════════════════════════════════════════════════"
+          echo ""
+          {
+            echo "## 🎨 Image Studio panel"
+            echo ""
+            echo "### 👉 [Open the panel]($PANEL_URL)"
+            echo ""
+            echo '```'
+            echo "$PANEL_URL"
+            echo '```'
+            echo ""
+            echo "- Session length: **${STUDIO_TIMEOUT_MINUTES:-240} min** · target account default: **${TARGET_ACCOUNT}** · queue: **${IMAGE_QUEUE_PATH}**"
+            echo "- Paste prompts (one per line, \`TYPE | concept | prompt\`, or JSON), choose model / ratio / settings, then **Add to queue**."
+            echo "- Generation runs on this runner even if your connection drops — reopen the link to continue."
+            echo "- As soon as a set / image is rendered, **Gemini Web writes its title · tags · category · description + Zedge policy check** (same image_metadata.mjs). You can Edit / Redo it on the card."
+            echo "- **Distribute** then sends the JPGs to R2 and pushes the Firebase record **with the metadata already inside** (ringtone-job order) — the Zedge bot never skips it for missing metadata. Policy-flagged items are pushed as status failed / held."
+            echo "- **Finish session** ends the panel; a final Firebase-scan metadata pass runs only if some record was pushed without metadata."
+            echo "- 🔀 Target **spread** hands a batch out across zedge_1–4 (each set/image to a different, least-loaded account); the per-account checkboxes choose which accounts take part."
+            echo "- 🔒 **One image / set → one Zedge account.** Distributed items are locked; re-sending to another (or the same) account is refused, frames cannot be regenerated after distribution, and a SHA-256 ledger (\`distribution_ledger.json\` in the artifact) blocks any byte-identical file ever uploaded before."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: 🖥️ Panel session (live log — ends when you press Finish, on idle auto-finish, or at timeout)
+        if: github.event.inputs.mode == 'image_studio'
+        run: |
+          PID="$(cat /tmp/studio_server.pid)"
+          echo "🔗 Panel: $(cat /tmp/studio_url.txt)"
+          echo "⏳ Waiting for the session to finish (server pid $PID)..."
+          # Stream the studio log live into the Actions log while the server is alive
+          tail -n +1 -f /tmp/studio_server.log --pid="$PID" || true
+          # Small grace period for the result file to be flushed
+          sleep 3
+          kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
+          if [ ! -f /tmp/studio_result.json ]; then
+            echo "⚠️ No result file — the server stopped unexpectedly"
+            echo '{"reason":"server stopped unexpectedly","items":0,"generated":0,"frames":0,"distributed":0,"records":0,"runMetadata":false}' > /tmp/studio_result.json
+          fi
+          cat /tmp/studio_result.json
+
+
+      - name: 📤 Publish session result
+        id: result
+        if: always() && github.event.inputs.mode == 'image_studio'
+        run: |
+          R=/tmp/studio_result.json
+          [ -f "$R" ] || echo '{"reason":"no session","items":0,"generated":0,"frames":0,"distributed":0,"records":0,"runMetadata":false}' > "$R"
+          echo "run_metadata=$(jq -r '.runMetadata // false' $R)" >> "$GITHUB_OUTPUT"
+          echo "records=$(jq -r '.records // 0' $R)" >> "$GITHUB_OUTPUT"
+          echo "generated=$(jq -r '.generated // 0' $R)" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 🎨 Image Studio results"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Ended because | $(jq -r '.reason' $R) |"
+            echo "| Items (sets + singles) | $(jq -r '.items' $R) |"
+            echo "| Fully generated items | $(jq -r '.generated' $R) |"
+            echo "| Frames generated | $(jq -r '.frames' $R) |"
+            echo "| Items distributed | $(jq -r '.distributed' $R) |"
+            echo "| Firebase records written | $(jq -r '.records' $R) |"
+            echo "| Items with metadata before distribute | $(jq -r '.itemsWithMeta // 0' $R) / $(jq -r '.generated' $R) |"
+            echo "| Records pushed WITH metadata | $(jq -r '.metaReady // 0' $R) / $(jq -r '.records' $R) |"
+            echo "| Zedge policy holds | $(jq -r '.held // 0' $R) |"
+            echo "| Final metadata pass after session | $(jq -r '.runMetadata' $R) |"
+            echo ""
+            echo "### 🔥 Sent per account"
+            echo ""
+            echo "| Account | Items |"
+            echo "|---------|-------|"
+            jq -r '.perAccount // {} | to_entries[] | "| \(.key) | \(.value) |"' $R
+            echo ""
+            if [ "$(jq -r '.manifest | length' $R)" != "0" ]; then
+              echo "<details><summary>📋 Item → account manifest</summary>"
+              echo ""
+              echo "| # | Item | Type | Status | Sent to (Firebase key) → Gemini title · category · policy |"
+              echo "|---|------|------|--------|-----------------------------------------------------------|"
+              jq -r '.manifest | to_entries[] | "| \(.key+1) | \(.value.folder) | \(.value.type) | \(.value.status) | \(if (.value.sentTo|length)==0 then "—" else ([.value.sentTo[] | "\(.account) (`\(.firebaseKey)`)" + (if .title != "" then " → \(.title) · \(.category) · \(.policy)" else " → metadata pending" end)] | join("<br>")) end) |"' $R
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+            echo "> All generated JPGs + prompts + metadata.json are attached as the **image-studio-output** artifact (also downloadable as ZIP from the panel)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: 🖼️ Generate Image Metadata & Patch Firebase
+        # mode=metadata: always. mode=image_studio: final pass only when the panel reported
+        # distributed records that still lack metadata (or the toggle was left on).
+        if: github.event.inputs.mode == 'metadata' || (github.event.inputs.mode == 'image_studio' && steps.result.outputs.run_metadata == 'true')
+        env:
+          GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
+          GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
+          IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
+        run: |
           node --experimental-vm-modules image_metadata.mjs
+
+      - name: 🗂️ Upload generated images (artifact)
+        if: always() && github.event.inputs.mode == 'image_studio'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-studio-output
+          path: /tmp/studio_out/
+          if-no-files-found: warn
+          retention-days: 7
+
+
+      - name: 🧾 Upload studio + tunnel logs
+        if: always() && github.event.inputs.mode == 'image_studio'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-studio-logs
+          path: |
+            /tmp/studio_server.log
+            /tmp/cloudflared.log
+          if-no-files-found: ignore
+          retention-days: 3
+
 
       - name: 🎥 Upload Session Recording
         if: always()
@@ -2777,7 +4500,11 @@ jobs:
       - name: 📊 Upload Run Summary
         if: always()
         run: |
-          echo "## 🖼️ Image Metadata Generator Results" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.mode }}" = "image_studio" ]; then
+            echo "## 🖼️ Final metadata pass (after Image Studio session)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## 🖼️ Image Metadata Generator Results" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
