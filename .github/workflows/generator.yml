@@ -61,7 +61,6 @@ on:
           - zedge_1
           - zedge_2
           - zedge_3
-          - zedge_4
           - all_accounts
 
       gemini_session:
@@ -108,7 +107,6 @@ jobs:
           ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
-          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
@@ -213,8 +211,7 @@ jobs:
           const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
             zedge_1: process.env.ZEDGE1_DB_URL,
             zedge_2: process.env.ZEDGE2_DB_URL,
-            zedge_3: process.env.ZEDGE3_DB_URL,
-            zedge_4: process.env.ZEDGE4_DB_URL
+            zedge_3: process.env.ZEDGE3_DB_URL
           }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
           if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
@@ -230,7 +227,7 @@ jobs:
           } else if (FIREBASE_DB_MAP[TARGET_ACCOUNT]) {
             TARGET_DB_URLS = [{ name: TARGET_ACCOUNT, url: FIREBASE_DB_MAP[TARGET_ACCOUNT] }];
           } else {
-            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, zedge_4, all_accounts`);
+            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, all_accounts`);
             process.exit(1);
           }
 
@@ -1618,7 +1615,6 @@ jobs:
           ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
-          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
@@ -1807,8 +1803,7 @@ jobs:
           const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
             zedge_1: process.env.ZEDGE1_DB_URL,
             zedge_2: process.env.ZEDGE2_DB_URL,
-            zedge_3: process.env.ZEDGE3_DB_URL,
-            zedge_4: process.env.ZEDGE4_DB_URL
+            zedge_3: process.env.ZEDGE3_DB_URL
           }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
           if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
@@ -2804,6 +2799,6 @@ jobs:
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Mode | Auto-scan (all images missing metadata) |" >> $GITHUB_STEP_SUMMARY
           echo "| Queue path | ${{ github.event.inputs.image_queue_path }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3, zedge_4) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Image metadata generated via Gemini Web (image upload) and patched back to Firebase." >> $GITHUB_STEP_SUMMARY
