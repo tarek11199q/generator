@@ -61,10 +61,16 @@ on:
           - zedge_1
           - zedge_2
           - zedge_3
+          - zedge_4
           - all_accounts
 
       gemini_session:
         description: "🌐 Gemini Web Session JSON (paste storageState JSON — no API key needed!)"
+        required: false
+        default: ""
+
+      stable_audio_token:
+        description: "🎵 Stable Audio Token (optional — leave empty to auto-create account)"
         required: false
         default: ""
 
@@ -83,8 +89,32 @@ jobs:
       - name: 📥 Install Dependencies
         run: |
           npm init -y
-          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright playwright-extra puppeteer-extra-plugin-stealth
+          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright playwright-extra puppeteer-extra-plugin-stealth patchright
           npx playwright install chromium --with-deps
+          npx patchright install chrome --with-deps || npx playwright install chrome --with-deps || true
+
+      - name: 🛡️ Start Cloudflare WARP SOCKS5 Proxy (Bypass WorkOS Datacenter IP Block)
+        continue-on-error: true
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq || (echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list && sudo apt-get update -qq)
+          sudo apt-get install -y cloudflare-warp
+          sudo warp-cli --accept-tos registration new || sudo warp-cli --accept-tos register || true
+          sudo warp-cli --accept-tos mode proxy || sudo warp-cli --accept-tos set-mode proxy || true
+          sudo warp-cli --accept-tos proxy port 40000 || sudo warp-cli --accept-tos set-proxy-port 40000 || true
+          sudo warp-cli --accept-tos connect || true
+          for i in 1 2 3 4 5; do
+            sleep 2
+            TRACE=$(curl -x socks5h://127.0.0.1:40000 -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace || true)
+            if echo "$TRACE" | grep -q "warp=on\|warp=plus"; then
+              echo "✅ Cloudflare WARP proxy active on socks5://127.0.0.1:40000"
+              echo "$TRACE" | grep -E "ip=|warp=|loc="
+              echo "WARP_PROXY=socks5://127.0.0.1:40000" >> $GITHUB_ENV
+              break
+            fi
+          done
 
       - name: 🎛️ Install ffmpeg (required for silence trim + volume boost)
         run: |
@@ -107,7 +137,8 @@ jobs:
           ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
-          STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
+          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
+          STABLE_AUDIO_TOKEN: ${{ github.event.inputs.stable_audio_token || secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           AUTO_GENERATE_COUNT: ${{ github.event.inputs.auto_generate_count }}
@@ -211,7 +242,8 @@ jobs:
           const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
             zedge_1: process.env.ZEDGE1_DB_URL,
             zedge_2: process.env.ZEDGE2_DB_URL,
-            zedge_3: process.env.ZEDGE3_DB_URL
+            zedge_3: process.env.ZEDGE3_DB_URL,
+            zedge_4: process.env.ZEDGE4_DB_URL
           }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
           if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
@@ -227,7 +259,7 @@ jobs:
           } else if (FIREBASE_DB_MAP[TARGET_ACCOUNT]) {
             TARGET_DB_URLS = [{ name: TARGET_ACCOUNT, url: FIREBASE_DB_MAP[TARGET_ACCOUNT] }];
           } else {
-            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, all_accounts`);
+            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, zedge_4, all_accounts`);
             process.exit(1);
           }
 
@@ -471,13 +503,14 @@ jobs:
           // metadata, 2–10 real tags. Violations are regenerated or skipped — never uploaded.
           const ZEDGE_POLICY_RULES = `ZEDGE MARKETPLACE POLICY (MANDATORY — a single violation permanently suspends the seller account):
           - 100% ORIGINAL work only. Never name, reference, imitate or hint at any real artist, band, singer, song, lyric, album, film, TV show, game, anime, cartoon, comic, character, franchise, brand, company, product, logo, trademark, sports team, celebrity or public figure. No "in the style of", no "sounds like", no theme/cover/remix of anything existing.
+          - STRICT PHONE RINGTONE & TECH BRAND BAN: Never recreate, imitate, name, or reference ANY stock phone ringtone, alert tone, or OS sound (e.g. Apple/iPhone Marimba, Reflection, Opening, Tri-tone, Ding, FaceTime, Siri; Samsung Over the Horizon, Whistle; Nokia Tune; Motorola Hello Moto; Google Pixel; Windows, Skype, Discord, Teams, Netflix, Intel). Never use brand names like iPhone, Apple, Samsung, Galaxy, Nokia, Android, Pixel in titles, prompts, or tags.
           - No sexual, suggestive, nude or adult content. No hate speech, slurs, hate symbols, discrimination or stereotypes. No violence, gore, weapons, drugs, self-harm or illegal activity. Nothing involving minors.
           - Metadata must be truthful and describe ONLY this item. No promotional or spam words (free, download, app, website, subscribe, follow, link, buy), no URLs, hashtags, @handles, emojis, brand or service names, no misleading keywords.
           - Keywords: between 2 and 10 genuine descriptive single words.`;
           const POLICY_PROMO = /\b(free|download|downloads|website|subscribe|follow|buy|sale|discount|promo|www|http|https|telegram|whatsapp|instagram|tiktok|youtube|facebook|twitter|zedge)\b/i;
           const POLICY_ADULT = /\b(sexy|sex|sexual|nude|nudity|naked|porn|porno|xxx|erotic|erotica|boobs|breasts?|booty|bikini|lingerie|topless|hot girls?|seductive|nsfw|hentai|fetish|stripper|thong|underwear|cleavage)\b/i;
           const POLICY_HARM = /\b(nigg\w*|fagg?\w*|retard\w*|murder|gore|gun|guns|rifle|pistol|shooting|shooter|terror\w*|nazi|hitler|swastika|isis|jihad|marijuana|cocaine|heroin|meth|drugs|suicide|self-harm|rape|racist|slur)\b/i;
-          const POLICY_IP = /\b(disney|pixar|marvel|dc comics|batman|superman|spider-?man|iron ?man|avengers|wolverine|x-?men|deadpool|harley quinn|star ?wars|darth|vader|yoda|jedi|mandalorian|grogu|harry ?potter|hogwarts|lord of the rings|hobbit|game of thrones|stranger things|squid game|breaking bad|pokemon|pikachu|charizard|super mario|luigi|zelda|minecraft|fortnite|roblox|among us|gta|call of duty|pubg|free fire|valorant|league of legends|overwatch|god of war|kratos|elden ring|naruto|goku|dragon ?ball|one piece|luffy|attack on titan|demon slayer|jujutsu|gojo|itachi|sasuke|death note|my hero academia|hello kitty|sanrio|mickey|minnie|donald duck|elsa|moana|encanto|toy story|shrek|minions|despicable|kung fu panda|spongebob|simpsons|rick and morty|peppa|paw patrol|barbie|hot wheels|lego|nike|adidas|puma|gucci|louis vuitton|iphone|samsung|xiaomi|oneplus|huawei|tesla|bmw|mercedes|audi|ferrari|lamborghini|porsche|toyota|coca-?cola|pepsi|starbucks|mcdonald'?s|kfc|netflix|spotify|nfl|nba|fifa|uefa|real madrid|barcelona|manchester united|liverpool fc|juventus|psg|messi|ronaldo|neymar|mbappe|lebron|taylor swift|beyonce|drake|eminem|rihanna|bts|blackpink|billie eilish|ed sheeran|weeknd|bad bunny|justin bieber|ariana grande|dua lipa|coldplay|imagine dragons|linkin park|metallica|beatles|nirvana|michael jackson|elvis|kanye|travis scott|post malone|shakira|adele|bruno mars|hans zimmer|john williams|bollywood|shah rukh|salman khan|allu arjun|pushpa|kgf|pathaan|jawan|kabir singh|arijit|pritam|ar rahman|a\.r\. rahman|anirudh|nokia|nokia tune|marimba|over the horizon|xbox|playstation|nintendo|godzilla|king kong|jurassic|transformers|optimus prime|bumblebee|pirates of the caribbean|jack sparrow|james bond|mission impossible|john wick|fast and furious|terminator|poppy playtime|huggy wuggy|skibidi|fnaf|cuphead|genshin|honkai|clash of clans|clash royale|brawl stars|candy crush|angry birds|subway surfers|temple run|flappy bird|tom and jerry|doraemon|shinchan|ben 10|scooby|looney|bugs bunny|winnie the pooh|cars movie|lightning mcqueen|olaf|stitch|lilo|baymax|zootopia|inside out|wednesday addams|squid|haikyuu|chainsaw man|spy x family|frieren|solo leveling|sung jinwoo)\b/i;
+          const POLICY_IP = /\b(disney|pixar|marvel|dc comics|batman|superman|spider-?man|iron ?man|avengers|wolverine|x-?men|deadpool|harley quinn|star ?wars|darth|vader|yoda|jedi|mandalorian|grogu|harry ?potter|hogwarts|lord of the rings|hobbit|game of thrones|stranger things|squid game|breaking bad|pokemon|pikachu|charizard|super mario|luigi|zelda|minecraft|fortnite|roblox|among us|gta|call of duty|pubg|free fire|valorant|league of legends|overwatch|god of war|kratos|elden ring|naruto|goku|dragon ?ball|one piece|luffy|attack on titan|demon slayer|jujutsu|gojo|itachi|sasuke|death note|my hero academia|hello kitty|sanrio|mickey|minnie|donald duck|elsa|moana|encanto|toy story|shrek|minions|despicable|kung fu panda|spongebob|simpsons|rick and morty|peppa|paw patrol|barbie|hot wheels|lego|nike|adidas|puma|gucci|louis vuitton|iphone|ipad|ipod|apple|ios|macintosh|macbook|imac|airdrop|facetime|imessage|siri|marimba|reflection|tritone|tri-?tone|samsung|galaxy|over the horizon|nokia|nokia tune|nokia tone|gran vals|motorola|hello moto|google pixel|pixel chime|sony xperia|xperia|blackberry|windows phone|android|skype|microsoft teams|teams ringtone|discord chime|discord call|slack knock|intel inside|netflix tudum|tudum|playstation|xbox|nintendo|game boy|xiaomi|oneplus|huawei|tesla|bmw|mercedes|audi|ferrari|lamborghini|porsche|toyota|coca-?cola|pepsi|starbucks|mcdonald'?s|kfc|netflix|spotify|nfl|nba|fifa|uefa|real madrid|barcelona|manchester united|liverpool fc|juventus|psg|messi|ronaldo|neymar|mbappe|lebron|taylor swift|beyonce|drake|eminem|rihanna|bts|blackpink|billie eilish|ed sheeran|weeknd|bad bunny|justin bieber|ariana grande|dua lipa|coldplay|imagine dragons|linkin park|metallica|beatles|nirvana|michael jackson|elvis|kanye|travis scott|post malone|shakira|adele|bruno mars|hans zimmer|john williams|bollywood|shah rukh|salman khan|allu arjun|pushpa|kgf|pathaan|jawan|kabir singh|arijit|pritam|ar rahman|a\.r\. rahman|anirudh|godzilla|king kong|jurassic|transformers|optimus prime|bumblebee|pirates of the caribbean|jack sparrow|james bond|mission impossible|john wick|fast and furious|terminator|poppy playtime|huggy wuggy|skibidi|fnaf|cuphead|genshin|honkai|clash of clans|clash royale|brawl stars|candy crush|angry birds|subway surfers|temple run|flappy bird|tom and jerry|doraemon|shinchan|ben 10|scooby|looney|bugs bunny|winnie the pooh|cars movie|lightning mcqueen|olaf|stitch|lilo|baymax|zootopia|inside out|wednesday addams|squid|haikyuu|chainsaw man|spy x family|frieren|solo leveling|sung jinwoo)\b/i;
           function zedgePolicyIssues(meta) {
             const issues = [];
             const fields = { title: meta.title || '', tags: meta.tags || '', description: meta.description || '', prompt: meta.enhancedPrompt || '' };
@@ -547,7 +580,7 @@ jobs:
             console.log(`  🤖 Generating enhanced metadata...`);
 
             const genres = ['Classical', 'Jazz', 'Acoustic Folk', 'Heavy Metal', 'Country', 'Reggae', 'Blues', 'Latin', 'Bollywood', 'Cinematic Orchestral', 'World Music', 'Celtic Harp', 'Tribal Percussion', 'Soul', 'Funk', 'Opera', 'Bluegrass', 'Flamenco', 'Bossa Nova', 'Salsa', 'Griot', 'Ambient Nature', 'Medieval', 'Renaissance', 'Baroque', 'Gospel', 'R&B', 'Trap Soul', 'Neo Soul', 'Indie Folk', 'Post-Rock', 'Afrobeat', 'K-Pop Instrumental', 'Synthwave', 'Lofi Hip-Hop'];
-            const instruments = ['Grand Piano', 'Violin', 'Trumpet', 'Saxophone', 'Cello', 'Acoustic Guitar', 'Sitar', 'Banjo', 'Ukulele', 'Accordion', 'Harmonica', 'Flute', 'Djembe Drums', 'Music Box', 'Marimba', 'Kalimba', 'Bagpipes', 'Steel Pan', 'Harp', 'Didgeridoo', 'Koto', 'Ocarina', 'Lute', 'Tambourine', 'Erhu', 'Duduk', 'Hurdy Gurdy', 'Hang Drum', 'Electric Sitar', 'Theremin'];
+            const instruments = ['Grand Piano', 'Violin', 'Trumpet', 'Saxophone', 'Cello', 'Acoustic Guitar', 'Sitar', 'Banjo', 'Ukulele', 'Accordion', 'Harmonica', 'Flute', 'Djembe Drums', 'Music Box', 'Vibraphone', 'Kalimba', 'Bagpipes', 'Steel Pan', 'Harp', 'Didgeridoo', 'Koto', 'Ocarina', 'Lute', 'Tambourine', 'Erhu', 'Duduk', 'Hurdy Gurdy', 'Hang Drum', 'Electric Sitar', 'Theremin'];
             const moods = ['Peaceful', 'Energetic', 'Mysterious', 'Joyful', 'Melancholic', 'Heroic', 'Whimsical', 'Dark', 'Bright', 'Epic', 'Spooky', 'Nostalgic', 'Rustic', 'Celestial', 'Primal', 'Graceful', 'Intense', 'Playful', 'Romantic', 'Triumphant', 'Haunting', 'Serene', 'Frantic', 'Dreamlike'];
 
             const animals = ['Lion Roar', 'Elephant Trumpet', 'Wolf Howl', 'Whale Song', 'Tropical Birds', 'Eagle Cry', 'Owl Hoot', 'Cat Purr/Meow', 'Dog Barking', 'Horse Neigh', 'Dolphin Click', 'Frog Croak', 'Cricket Chirp', 'Cicada Buzz', 'Fox Scream', 'Bear Growl', 'Humpback Whale', 'Cheetah Chirp', 'Snow Leopard', 'Parrot Mimicry'];
@@ -615,11 +648,13 @@ jobs:
               ? `CRAFT RULES for a premium NOTIFICATION sound (${LENGTH_SECONDS}s):\n` +
                 `- Design ONE memorable 2-4 note motif with a clean, bright attack and a smooth natural decay.\n` +
                 `- It must stay pleasant after being heard 100 times a day: no harsh, shrill, or startling frequencies.\n` +
-                `- It must be instantly recognizable and clearly distinct from default iPhone/Samsung tones.\n` +
+                `- ZERO IMITATION: Absolutely forbidden to imitate, copy, or reference default iPhone, Samsung, Nokia, or Pixel tones.\n` +
+                `- It must be 100% freshly composed, unique, and clearly distinct from any manufacturer's phone sounds.\n` +
                 `- Name the real instrument or sound source, the exact articulation (plucked, struck, breathy...), and the feel of the decay tail.`
               : `CRAFT RULES for a chart-topping RINGTONE (${LENGTH_SECONDS}s):\n` +
                 `- The hook must be instantly recognizable within the FIRST 2 SECONDS.\n` +
                 `- Give it a clear melodic identity someone could hum back after one listen.\n` +
+                `- ZERO IMITATION: Absolutely forbidden to copy or imitate stock phone ringtones from Apple, Samsung, Nokia, or Motorola.\n` +
                 `- It must loop seamlessly and cut through a noisy room on a small phone speaker (strong mids, crisp highs, no muddy lows).\n` +
                 `- Name real instruments, an approximate BPM, a key or tonal center, and a clear structure (hook, build, resolve).`;
 
@@ -738,254 +773,666 @@ jobs:
             };
           }
 
-          // ─── CREDENTIAL HELPERS ────────────────────────────────────────────────────
-          function generateRandomEmail() {
-            const ts  = Date.now();
-            const rnd = Math.random().toString(36).substring(2, 10);
-            const domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
-            const domain  = domains[Math.floor(Math.random() * domains.length)];
-            return `stableaudio_${rnd}_${ts}@${domain}`;
-          }
-
+          // ─── CREDENTIAL & MULTI-PROVIDER TEMP-MAIL HELPERS ────────────────────────
           function generateStrongPassword() {
-            const lc  = 'abcdefghijklmnopqrstuvwxyz';
-            const uc  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-            const num = '0123456789';
-            const sp  = '!@#$%^&*';
-            let pw = '';
-            pw += lc[Math.floor(Math.random() * lc.length)];
-            pw += lc[Math.floor(Math.random() * lc.length)];
-            pw += uc[Math.floor(Math.random() * uc.length)];
-            pw += uc[Math.floor(Math.random() * uc.length)];
-            pw += num[Math.floor(Math.random() * num.length)];
-            pw += num[Math.floor(Math.random() * num.length)];
-            pw += sp[Math.floor(Math.random() * sp.length)];
-            pw += sp[Math.floor(Math.random() * sp.length)];
-            const all = lc + uc + num + sp;
-            for (let i = 0; i < 4; i++) pw += all[Math.floor(Math.random() * all.length)];
-            return pw.split('').sort(() => Math.random() - 0.5).join('');
+            // High-entropy passphrase + mixed characters that scores 4/4 on WorkOS AuthKit's
+            // client-side zxcvbn-ts validator and never appears in HIBP breach lists.
+            const words1 = ['Velvet', 'Cobalt', 'Zephyr', 'Quartz', 'Falcon', 'Breeze', 'Cipher', 'Tundra'];
+            const words2 = ['Meadow', 'Harbor', 'Summit', 'Galaxy', 'Canyon', 'Orbit', 'Prism', 'Voyage'];
+            const w1 = words1[Math.floor(Math.random() * words1.length)];
+            const w2 = words2[Math.floor(Math.random() * words2.length)];
+            const num = Math.floor(Math.random() * 900) + 100;
+            const rnd = Math.random().toString(36).substring(2, 6);
+            return `${w1}#${num}!${w2}$${rnd}Q9`;
           }
 
-          // ─── AUTO ACCOUNT CREATION (Playwright — mirrors background.js) ───────────
-          // Called automatically when Stable Audio API returns a rate-limit error.
-          // Returns the new Bearer token string, or throws on failure.
-          async function createStableAudioAccount() {
-            const email    = generateRandomEmail();
-            const password = generateStrongPassword();
+          // Creates a real disposable inbox using a 3-provider failover chain:
+          //   1. api.mail.tm (with clean lowercase alphanumeric username + simple mailPw so /token never 401s)
+          //   2. api.mail.gw (mirror provider with separate domain pool)
+          //   3. api.guerrillamail.com (session-based disposable inbox)
+          async function createTempMailAccount() {
+            const firsts = ['alex', 'jordan', 'taylor', 'morgan', 'casey', 'riley', 'quinn', 'avery'];
+            const lasts  = ['carter', 'bennett', 'hayes', 'parker', 'collins', 'reid', 'foster', 'brooks'];
+            const f = firsts[Math.floor(Math.random() * firsts.length)];
+            const l = lasts[Math.floor(Math.random() * lasts.length)];
 
-            console.log('\n  🤖 AUTO ACCOUNT CREATION STARTED');
-            console.log(`  📧 Email   : ${email}`);
-            console.log(`  🔑 Password: ${password}`);
+            // Try Mail.tm and Mail.gw first
+            for (const apiBase of ['https://api.mail.tm', 'https://api.mail.gw']) {
+              try {
+                const domRes = await fetch(`${apiBase}/domains`);
+                if (!domRes.ok) throw new Error(`domains HTTP ${domRes.status}`);
+                const domData = await domRes.json();
+                const domains = (domData['hydra:member'] || []).filter(d => d.isActive !== false);
+                if (!domains.length) throw new Error('No active domains');
 
-            // Use playwright-extra + stealth plugin → bypasses Auth0 bot detection
-            // Xvfb virtual display is already running (started by the workflow step above)
-            const { chromium } = await import('playwright-extra');
-            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
-            chromium.use(StealthPlugin());
+                const domain = domains[Math.floor(Math.random() * domains.length)].domain;
+                const rnd = Math.random().toString(36).replace(/[^a-z0-9]/g, '').substring(0, 5);
+                const ts  = Date.now().toString().slice(-4);
+                // IMPORTANT: Pure lowercase alphanumeric local part (no dots/underscores) + simple
+                // alphanumeric password avoids Mail.tm/Mail.gw normalization mismatches that cause /token 401!
+                const rawAddress = `${f}${l}${rnd}${ts}@${domain}`.toLowerCase();
+                const mailPw = `MailPass${rnd}${ts}A1`;
 
-            const browser = await chromium.launch({
-              headless: false,  // Real browser on Xvfb — undetectable by Auth0
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-              ]
-            });
-
-            let capturedToken = null;
-
-            try {
-              const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-              });
-              const page = await context.newPage();
-
-              // ── Intercept network to capture Bearer token ──────────────────────────
-              // Stable Audio's SPA sends the access token in Authorization headers.
-              // We sniff it from outgoing requests to their API.
-              page.on('request', req => {
-                const auth = req.headers()['authorization'];
-                if (auth && auth.startsWith('Bearer ') && req.url().includes('stableaudio.com')) {
-                  const tok = auth.replace('Bearer ', '').trim();
-                  if (tok.length > 50) {
-                    capturedToken = tok;
-                    console.log('  🔑 Token captured from network request!');
-                  }
+                const accRes = await fetch(`${apiBase}/accounts`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                  body: JSON.stringify({ address: rawAddress, password: mailPw })
+                });
+                if (!accRes.ok) {
+                  const errTxt = await accRes.text().catch(() => '');
+                  throw new Error(`accounts HTTP ${accRes.status}: ${errTxt.slice(0, 100)}`);
                 }
-              });
-              // Also sniff /oauth/token response (PKCE code exchange) — this is the key one!
-              page.on('response', async resp => {
-                try {
-                  const url = resp.url();
-                  const isTokenEndpoint = url.includes('/oauth/token') || url.includes('/token') || url.includes('auth0') || url.includes('login.stableaudio');
-                  if (isTokenEndpoint && resp.status() === 200) {
-                    const json = await resp.json().catch(() => null);
-                    if (json && (json.access_token || json.id_token)) {
-                      capturedToken = json.access_token || json.id_token;
-                      console.log(`  🔑 Token captured from /oauth/token response!`);
+                const accData = await accRes.json();
+                const canonicalAddress = (accData.address || rawAddress).toLowerCase().trim();
+
+                // Brief pause so account creation commits before requesting JWT token
+                await sleep(1000);
+
+                let tokData = null;
+                for (let tTry = 1; tTry <= 2; tTry++) {
+                  const tokRes = await fetch(`${apiBase}/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ address: canonicalAddress, password: mailPw })
+                  });
+                  if (tokRes.ok) {
+                    tokData = await tokRes.json();
+                    break;
+                  }
+                  await sleep(1200);
+                }
+                if (!tokData?.token) throw new Error('token endpoint did not return token');
+
+                console.log(`  📬 Created real temp-mail inbox (${apiBase}): ${canonicalAddress}`);
+                return { provider: 'mailtm', apiBase, email: canonicalAddress, mailToken: tokData.token };
+              } catch (e) {
+                console.warn(`  ⚠️ ${apiBase} failed (${e.message}) — trying next temp-mail provider...`);
+              }
+            }
+
+            // Provider 3 fallback: GuerrillaMail JSON API
+            try {
+              const gmRes = await fetch('https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=en');
+              if (!gmRes.ok) throw new Error(`HTTP ${gmRes.status}`);
+              const gmData = await gmRes.json();
+              if (gmData?.email_addr && gmData?.sid_token) {
+                console.log(`  📬 Created GuerrillaMail inbox: ${gmData.email_addr}`);
+                return { provider: 'guerrilla', email: gmData.email_addr, mailToken: gmData.sid_token };
+              }
+            } catch (e) {
+              console.warn(`  ⚠️ GuerrillaMail failed (${e.message})`);
+            }
+
+            throw new Error('All temp-mail providers failed to create an inbox.');
+          }
+
+          // Extracts a 6-digit verification code from email subject/text/html (stripping HTML/CSS first)
+          function extractSixDigitOtp(subject = '', intro = '', text = '', html = '') {
+            const cleanHtml = String(html || '')
+              .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+              .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/&nbsp;/gi, ' ')
+              .replace(/\s+/g, ' ');
+            // Check subject, intro, plain text first (least noise), then stripped HTML
+            for (const src of [subject, intro, text, cleanHtml]) {
+              if (!src) continue;
+              const m = String(src).match(/\b(\d{6})\b/);
+              if (m) return m[1];
+            }
+            return null;
+          }
+
+          async function pollTempMailForOtp(inbox, timeoutMs = 60000) {
+            if (!inbox || !inbox.mailToken) return null;
+            const deadline = Date.now() + timeoutMs;
+            console.log(`  ⏳ Polling ${inbox.provider} inbox (${inbox.email}) for 6-digit verification code...`);
+
+            while (Date.now() < deadline) {
+              try {
+                if (inbox.provider === 'mailtm') {
+                  const res = await fetch(`${inbox.apiBase}/messages`, {
+                    headers: { 'Authorization': `Bearer ${inbox.mailToken}`, 'Accept': 'application/json' }
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    const msgs = Array.isArray(data) ? data : (data['hydra:member'] || []);
+                    for (const msg of msgs) {
+                      // Quick check on subject/intro before fetching full message
+                      const quickCode = extractSixDigitOtp(msg.subject, msg.intro, '', '');
+                      if (quickCode) return quickCode;
+
+                      const detailRes = await fetch(`${inbox.apiBase}/messages/${msg.id}`, {
+                        headers: { 'Authorization': `Bearer ${inbox.mailToken}`, 'Accept': 'application/json' }
+                      });
+                      if (detailRes.ok) {
+                        const detail = await detailRes.json();
+                        const htmlStr = Array.isArray(detail.html) ? detail.html.join(' ') : (detail.html || '');
+                        const code = extractSixDigitOtp(detail.subject, detail.intro, detail.text, htmlStr);
+                        if (code) return code;
+                      }
                     }
                   }
-                } catch {}
-              });
+                } else if (inbox.provider === 'guerrilla') {
+                  const res = await fetch(`https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0&sid_token=${encodeURIComponent(inbox.mailToken)}`);
+                  if (res.ok) {
+                    const data = await res.json();
+                    const list = data?.list || [];
+                    for (const msg of list) {
+                      if (/guerrillamail/i.test(msg.mail_from || '')) continue; // skip welcome email
+                      const quickCode = extractSixDigitOtp(msg.mail_subject, msg.mail_excerpt, '', '');
+                      if (quickCode) return quickCode;
 
-              // ── Step 1: Hit Auth0 logout to destroy SSO session server-side ──────
-              console.log('  🔓 Step 1: Destroying existing Auth0 SSO session...');
-              await page.goto('https://login.stableaudio.com/v2/logout', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-              await sleep(2000);
+                      const detailRes = await fetch(`https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${msg.mail_id}&sid_token=${encodeURIComponent(inbox.mailToken)}`);
+                      if (detailRes.ok) {
+                        const detail = await detailRes.json();
+                        const code = extractSixDigitOtp(detail.mail_subject, detail.mail_excerpt, '', detail.mail_body);
+                        if (code) return code;
+                      }
+                    }
+                  }
+                }
+              } catch {}
+              await sleep(3000);
+            }
+            return null;
+          }
 
-              // ── Step 2: Clear all cookies + localStorage ──────────────────────────
-              console.log('  🧹 Step 2: Wiping all cookies and storage...');
-              await context.clearCookies();
-              await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }).catch(() => {});
+          function isStableAudioHost(urlStr) {
+            try {
+              const u = new URL(urlStr);
+              return (
+                (u.hostname === 'stableaudio.com' || u.hostname === 'www.stableaudio.com') &&
+                !u.hostname.includes('login.') &&
+                !u.hostname.includes('authkit.')
+              );
+            } catch {
+              return false;
+            }
+          }
 
-              // ── Step 3: Load Stable Audio fresh ───────────────────────────────────
-              console.log('  🌐 Step 3: Loading fresh Stable Audio page...');
-              await page.goto('https://stableaudio.com', { waitUntil: 'networkidle', timeout: 30000 });
-              await sleep(2000);
+          // ── Human-like Hardware Mouse & Keyboard Helpers (isTrusted: true) ─────────
+          // WorkOS Radar blocks synthetic DOM element.click() (where event.isTrusted === false
+          // and clientX/clientY === 0). These helpers generate real browser pointer/mouse paths.
+          async function humanClick(page, locator) {
+            await locator.waitFor({ state: 'visible', timeout: 15000 });
+            const box = await locator.boundingBox();
+            if (box) {
+              const targetX = box.x + box.width * (0.3 + Math.random() * 0.4);
+              const targetY = box.y + box.height * (0.3 + Math.random() * 0.4);
+              await page.mouse.move(
+                Math.max(10, targetX - 80 + Math.random() * 60),
+                Math.max(10, targetY - 60 + Math.random() * 40),
+                { steps: 8 }
+              );
+              await sleep(80 + Math.floor(Math.random() * 90));
+              await page.mouse.move(targetX, targetY, { steps: 10 });
+              await sleep(90 + Math.floor(Math.random() * 120));
+              await page.mouse.down();
+              await sleep(55 + Math.floor(Math.random() * 75));
+              await page.mouse.up();
+            } else {
+              await locator.click();
+            }
+          }
 
-              // ── Step 4: Click Sign Up button ─────────────────────────────────────
-              console.log('  🖱️  Step 4: Looking for Sign Up button...');
-              const signupSelectors = [
-                'button:has-text("Sign up")',
-                'button:has-text("Sign Up")',
-                'a:has-text("Sign up")',
-                '[data-testid="signup"]'
-              ];
-              let clicked = false;
-              for (const sel of signupSelectors) {
-                try {
-                  await page.waitForSelector(sel, { timeout: 5000 });
-                  await page.click(sel);
-                  clicked = true;
-                  console.log(`  ✅ Sign Up clicked (${sel})`);
-                  break;
-                } catch {}
+          async function humanType(page, locator, text) {
+            await humanClick(page, locator);
+            await sleep(180 + Math.floor(Math.random() * 150));
+            await page.keyboard.press('Control+a');
+            await sleep(60);
+            await page.keyboard.press('Backspace');
+            await sleep(120);
+            for (const ch of text) {
+              await page.keyboard.type(ch, { delay: 35 + Math.floor(Math.random() * 55) });
+            }
+            await sleep(250 + Math.floor(Math.random() * 150));
+          }
+
+          // ─── AUTO ACCOUNT CREATION (Patchright + Real Chrome + WARP + OTP) ─────────
+          async function createStableAudioAccount() {
+            let patchrightChromium = null;
+            try {
+              const pr = await import('patchright');
+              patchrightChromium = pr.chromium;
+              console.log('  🛡️ Using Patchright (CDP-patched undetected Chromium driver)');
+            } catch {
+              const pw = await import('playwright');
+              patchrightChromium = pw.chromium;
+              console.log('  ⚠️ Patchright not found — falling back to Playwright Chromium');
+            }
+
+            const warpProxy = (process.env.WARP_PROXY || '').trim();
+            // All attempts use a real Temp-Mail inbox because WorkOS AuthKit always asks
+            // "Verify your email" (6-digit OTP) right after /sign-up/password!
+            const strategies = [
+              { useWarp: !!warpProxy, label: warpProxy ? 'WARP Proxy + Real Temp-Mail OTP' : 'Direct + Real Temp-Mail OTP' },
+              { useWarp: !!warpProxy, label: warpProxy ? 'WARP Proxy + Real Temp-Mail OTP (Retry)' : 'Direct + Real Temp-Mail OTP (Retry)' },
+              { useWarp: false,       label: 'Direct Connection + Real Temp-Mail OTP' }
+            ];
+
+            for (let idx = 0; idx < strategies.length; idx++) {
+              const strat = strategies[idx];
+              const attempt = idx + 1;
+              const password = generateStrongPassword();
+              let inbox = null;
+              try {
+                inbox = await createTempMailAccount();
+              } catch (mailErr) {
+                console.warn(`  ⚠️ Could not create temp-mail inbox on attempt ${attempt}: ${mailErr.message}`);
+                if (attempt < strategies.length) continue;
+                throw mailErr;
               }
-              if (!clicked) {
-                // Try evaluating in-page
-                clicked = await page.evaluate(() => {
-                  const btn = Array.from(document.querySelectorAll('button')).find(b =>
-                    ['sign up', 'sign-up'].includes(b.textContent.trim().toLowerCase())
-                  );
-                  if (btn) { btn.click(); return true; }
-                  return false;
+              const { email } = inbox;
+
+              console.log(`\n  🤖 AUTO ACCOUNT CREATION STARTED (Attempt ${attempt}/${strategies.length}: ${strat.label})`);
+              console.log(`  📧 Email   : ${email}`);
+              console.log(`  🔑 Password: ${password}`);
+
+              const profileDir = `/tmp/sa_chrome_profile_${Date.now()}_${attempt}`;
+              fs.mkdirSync(profileDir, { recursive: true });
+
+              const launchOpts = {
+                channel: 'chrome',
+                headless: false,
+                viewport: null, // Patchright best practice: do NOT inject custom viewport or fake Windows UA on Linux
+                args: [
+                  '--no-sandbox',
+                  '--disable-setuid-sandbox',
+                  '--disable-dev-shm-usage',
+                  '--window-size=1280,800'
+                ]
+              };
+              if (strat.useWarp && warpProxy) {
+                launchOpts.proxy = { server: warpProxy };
+                console.log(`  🌐 Routing browser through Cloudflare WARP proxy (${warpProxy})...`);
+              }
+
+              let context = null;
+              try {
+                try {
+                  context = await patchrightChromium.launchPersistentContext(profileDir, launchOpts);
+                } catch {
+                  delete launchOpts.channel;
+                  context = await patchrightChromium.launchPersistentContext(profileDir, launchOpts);
+                }
+
+                let capturedToken = null;
+                const page = context.pages()[0] || await context.newPage();
+
+                // ── Node-side Network Interception (100% invisible to WorkOS Radar) ──
+                context.on('request', req => {
+                  const auth = req.headers()['authorization'];
+                  if (auth && auth.startsWith('Bearer ')) {
+                    const tok = auth.replace('Bearer ', '').trim();
+                    if (tok.length > 40 && !capturedToken) {
+                      capturedToken = tok;
+                      console.log(`  🔑 Token captured from outgoing request (${req.url().slice(0, 60)})!`);
+                    }
+                  }
                 });
-                if (!clicked) throw new Error('Could not find Sign Up button on Stable Audio page.');
-              }
-              await sleep(3000);
 
-              // ── Step 5: Wait for Auth0 email input ───────────────────────────────
-              console.log('  📝 Step 5: Waiting for Auth0 registration form...');
-              await page.waitForSelector('input[name="email"]', { timeout: 20000 });
+                context.on('response', async resp => {
+                  try {
+                    const url = resp.url();
+                    if (url.includes('authkit.app') && resp.status() >= 400) {
+                      const errBody = await resp.text().catch(() => '');
+                      console.warn(`  ⚠️ AuthKit HTTP ${resp.status()} on ${url.split('?')[0]}: ${errBody.slice(0, 200)}`);
+                    }
+                    const isTokenEndpoint =
+                      url.includes('/oauth/token') ||
+                      url.includes('/token') ||
+                      url.includes('/authenticate') ||
+                      url.includes('authkit.app') ||
+                      url.includes('workos') ||
+                      url.includes('auth0') ||
+                      url.includes('login.stableaudio') ||
+                      url.includes('api.stableaudio.com');
+                    if (isTokenEndpoint && resp.status() === 200) {
+                      const ct = resp.headers()['content-type'] || '';
+                      if (ct.includes('json')) {
+                        const json = await resp.json().catch(() => null);
+                        const tok = json?.access_token || json?.accessToken || json?.token || json?.id_token || json?.data?.access_token;
+                        if (tok && typeof tok === 'string' && tok.length > 40 && !capturedToken) {
+                          capturedToken = tok;
+                          console.log(`  🔑 Token captured from auth response (${url.slice(0, 60)})!`);
+                        }
+                      }
+                    }
+                  } catch {}
+                });
 
-              // ── Step 6: Fill email + password using React-compatible dispatch ────
-              console.log('  ✍️  Step 6: Filling credentials...');
-              await page.evaluate(({ em, pw }) => {
-                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                const emailEl = document.querySelector('input[name="email"]');
-                const passEl  = document.querySelector('input[name="password"]');
-                if (emailEl) {
-                  setter.call(emailEl, em);
-                  emailEl.dispatchEvent(new Event('input',  { bubbles: true }));
-                  emailEl.dispatchEvent(new Event('change', { bubbles: true }));
+                // ── Step 1: Load Stable Audio fresh ───────────────────────────────────
+                console.log('  🌐 Step 1: Loading fresh Stable Audio page...');
+                await page.goto('https://stableaudio.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await sleep(2500 + Math.floor(Math.random() * 1000));
+
+                await page.mouse.move(300 + Math.random() * 200, 250 + Math.random() * 150, { steps: 10 });
+                await sleep(500);
+
+                // ── Step 2: Click Sign Up button using real hardware mouse click ─────
+                console.log('  🖱️  Step 2: Clicking Sign Up button...');
+                const signupLoc = page.locator('button:has-text("Sign up"), button:has-text("Sign Up"), a:has-text("Sign up"), a:has-text("Sign Up"), [data-testid="signup"]').first();
+                await humanClick(page, signupLoc);
+                console.log('  ✅ Sign Up clicked');
+
+                await sleep(3000);
+                await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+
+                // ── Step 3: Fill Email on /sign-up ───────────────────────────────────
+                console.log(`  📝 Step 3: On AuthKit page (${page.url().split('?')[0]})...`);
+                const emailLoc = page.locator('input[name="email"], input[type="email"], input[autocomplete="email"]').first();
+                await emailLoc.waitFor({ state: 'visible', timeout: 20000 });
+
+                await sleep(800 + Math.floor(Math.random() * 600));
+
+                const firstLoc = page.locator('input[name="first_name"], input[name="firstName"]').first();
+                if (await firstLoc.isVisible().catch(() => false)) {
+                  await humanType(page, firstLoc, 'Alex');
                 }
-                if (passEl) {
-                  setter.call(passEl, pw);
-                  passEl.dispatchEvent(new Event('input',  { bubbles: true }));
-                  passEl.dispatchEvent(new Event('change', { bubbles: true }));
+                const lastLoc = page.locator('input[name="last_name"], input[name="lastName"]').first();
+                if (await lastLoc.isVisible().catch(() => false)) {
+                  await humanType(page, lastLoc, 'Carter');
                 }
-              }, { em: email, pw: password });
-              await sleep(800);
 
-              // ── Step 7: Submit the form ───────────────────────────────────────────
-              console.log('  🚀 Step 7: Submitting registration form...');
-              await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
-              await page.click('button[type="submit"]');
+                console.log('  ✍️  Step 4: Typing email with human keystroke cadence...');
+                await humanType(page, emailLoc, email);
+                await sleep(500 + Math.floor(Math.random() * 400));
 
-              // ── Step 8: Wait for OAuth code exchange + extract token ──────────────
-              // Auth0 redirects back to stableaudio.com/generate?code=...&state=...
-              // The SPA POSTs to /oauth/token to exchange the code for a Bearer token.
-              // We MUST NOT navigate away during this exchange — stay on callback URL!
-              console.log('  ⏳ Step 8: Waiting for OAuth code exchange + token...');
+                const passLoc = page.locator('input[name="password"], input[type="password"]').first();
+                const passVisibleOnStep1 = await passLoc.isVisible().catch(() => false);
 
-              // 8a: Wait until we land on stableaudio.com
-              if (!page.url().includes('stableaudio.com')) {
-                try {
-                  await page.waitForURL(url => url.includes('stableaudio.com'), { timeout: 60000 });
-                  console.log(`  ✅ OAuth callback arrived: ${page.url()}`);
-                } catch {
-                  console.warn(`  ⚠️ Timeout waiting for redirect — on: ${page.url()}`);
+                if (!passVisibleOnStep1) {
+                  console.log('  ➡️  Submitting email step (real mouse click on Continue)...');
+                  const continueBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Continue"), form button[type="submit"]').first();
+                  await humanClick(page, continueBtn);
+
+                  console.log('  🔑 Step 5: Waiting for /sign-up/password screen...');
+                  await passLoc.waitFor({ state: 'visible', timeout: 20000 });
+                  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+                  await sleep(1000 + Math.floor(Math.random() * 600));
                 }
-              } else {
-                console.log(`  ✅ Already on stableaudio.com: ${page.url()}`);
-              }
 
-              // 8b: If URL has ?code= the SPA is exchanging it — wait for clean URL
-              if (page.url().includes('code=')) {
-                console.log('  🔄 OAuth code exchange in progress — waiting (do NOT navigate)...');
-                try {
+                // ── Step 6: Type Password & Submit with real hardware mouse click ────
+                console.log('  ✍️  Step 6: Typing password with human keystroke cadence...');
+                await humanType(page, passLoc, password);
+                await sleep(700 + Math.floor(Math.random() * 500));
+
+                console.log('  🚀 Step 7: Clicking Continue button on password form...');
+                const passContinueBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Continue"), button[type="submit"]:has-text("Sign up")').first();
+                await humanClick(page, passContinueBtn);
+
+                // Wait up to 8s to transition away from /sign-up/password (to /email-verification or stableaudio.com)
+                for (let w = 0; w < 16; w++) {
+                  await sleep(500);
+                  if (isStableAudioHost(page.url()) || capturedToken) break;
+                  if (!page.url().includes('/sign-up/password')) break;
+                }
+
+                // Check for REAL error alerts (specifically ignore "Verify your email", which is the OTP screen!)
+                const alertLoc = page.locator('[role="alert"], .ak-Error, [data-accent-color="red"]').first();
+                let isVerifyEmailScreen = false;
+                if (!isStableAudioHost(page.url()) && await alertLoc.isVisible().catch(() => false)) {
+                  const alertText = (await alertLoc.innerText().catch(() => '')).trim();
+                  if (/verify your email|verification code|check your email|enter the.*code|sent.*code/i.test(alertText)) {
+                    isVerifyEmailScreen = true;
+                    console.log(`  📩 AuthKit transitioned to Email Verification screen ("${alertText}")!`);
+                  } else if (alertText && /blocked|contact support|invalid|disposable|not allowed|already|error|weak/i.test(alertText)) {
+                    console.warn(`  ⚠️ AuthKit error alert on attempt ${attempt}: "${alertText}"`);
+                    if (attempt < strategies.length) {
+                      console.log('  🔄 Switching to next strategy...');
+                      continue;
+                    }
+                    throw new Error(`WorkOS Radar blocked signup: ${alertText}`);
+                  }
+                }
+
+                // ── Step 7b: Handle "Verify your email" (6-digit OTP screen) ─────────
+                const otpLoc = page.locator('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[maxlength="1"], input[maxlength="6"]').first();
+                const onVerifyPage =
+                  isVerifyEmailScreen ||
+                  page.url().includes('email-verification') ||
+                  page.url().includes('verify') ||
+                  (await otpLoc.isVisible().catch(() => false));
+
+                if (!isStableAudioHost(page.url()) && onVerifyPage) {
+                  console.log(`  📩 Step 7b: On Email Verification screen (${page.url().split('?')[0]}) — waiting for OTP email...`);
+                  const otp = await pollTempMailForOtp(inbox, 60000);
+                  if (!otp) {
+                    console.warn(`  ⚠️ Did not receive OTP email within 60s on attempt ${attempt}.`);
+                    if (attempt < strategies.length) continue;
+                    throw new Error('Timed out waiting for 6-digit OTP email from WorkOS AuthKit.');
+                  }
+
+                  console.log(`  🔢 Received 6-digit OTP code: ${otp} — entering code into AuthKit...`);
+                  await sleep(1000);
+
+                  // Strategy 1: DOM Property & Event Injection (handles transparent input-otp, 6 boxes, and paste event)
+                  try {
+                    await page.evaluate((code) => {
+                      const allInputs = Array.from(document.querySelectorAll('input')).filter(el => {
+                        const t = (el.getAttribute('type') || '').toLowerCase();
+                        return t !== 'hidden' && t !== 'checkbox' && t !== 'radio';
+                      });
+
+                      // Case 1A: 6 individual boxes
+                      if (allInputs.length === 6) {
+                        for (let i = 0; i < 6; i++) {
+                          const inp = allInputs[i];
+                          inp.focus();
+                          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                          if (setter) setter.call(inp, code[i]);
+                          else inp.value = code[i];
+                          inp.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                          inp.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                          inp.dispatchEvent(new KeyboardEvent('keyup', { key: code[i], bubbles: true }));
+                        }
+                      }
+
+                      // Case 1B: Single input (input-otp, name="code", etc.)
+                      const targetInput = document.querySelector('input[autocomplete="one-time-code"], input[name="code"], input[data-input-otp], input[inputmode="numeric"]') || (allInputs.length === 1 ? allInputs[0] : null);
+                      if (targetInput) {
+                        targetInput.focus();
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) setter.call(targetInput, code);
+                        else targetInput.value = code;
+                        targetInput.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                        targetInput.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                      }
+
+                      // Case 1C: Clipboard paste event
+                      const pasteTarget = targetInput || allInputs[0] || document.querySelector('[data-input-otp-container], form') || document.activeElement;
+                      if (pasteTarget) {
+                        const dt = new DataTransfer();
+                        dt.setData('text/plain', code);
+                        const pasteEvt = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+                        pasteTarget.dispatchEvent(pasteEvt);
+                      }
+                    }, otp);
+                  } catch (e) {
+                    console.warn(`  ⚠️ DOM injection notice: ${e.message}`);
+                  }
+
+                  // Strategy 2: Native Playwright Focus & Type/Fill
+                  try {
+                    const separateInputs = page.locator('input[maxlength="1"]');
+                    const sepCount = await separateInputs.count().catch(() => 0);
+                    if (sepCount === 6) {
+                      for (let i = 0; i < 6; i++) {
+                        const inp = separateInputs.nth(i);
+                        await inp.click({ force: true }).catch(() => {});
+                        await inp.fill(otp[i]).catch(() => {});
+                        await sleep(50);
+                      }
+                    } else {
+                      const inputToClick = page.locator('input:not([type="hidden"]), [data-input-otp-container], [data-input-otp-slot], form').first();
+                      if (await inputToClick.isVisible().catch(() => false)) {
+                        await humanClick(page, inputToClick).catch(() => inputToClick.click({ force: true }));
+                      } else {
+                        await page.locator('input').first().focus({ force: true }).catch(() => {});
+                      }
+                      await sleep(200);
+                      for (const digit of otp) {
+                        await page.keyboard.type(digit, { delay: 60 + Math.floor(Math.random() * 40) });
+                        await sleep(40);
+                      }
+                    }
+                  } catch (typeErr) {
+                    console.warn(`  ⚠️ Keystroke entry: ${typeErr.message}`);
+                  }
+
+                  await sleep(1500);
+
+                  // ── Submit OTP ──
+                  if (!isStableAudioHost(page.url())) {
+                    const submitSelectors = [
+                      'button[type="submit"]',
+                      'button:has-text("Verify")',
+                      'button:has-text("Continue")',
+                      'button:has-text("Confirm")',
+                      'button:has-text("Submit")',
+                      'button.ak-PrimaryButton',
+                      '.ak-Button--primary',
+                      '[data-testid="submit-button"]'
+                    ];
+                    let clicked = false;
+                    for (const sel of submitSelectors) {
+                      const btn = page.locator(sel).first();
+                      if (await btn.isVisible().catch(() => false)) {
+                        console.log(`  🖱️  Clicking submit button (${sel})...`);
+                        await humanClick(page, btn).catch(() => btn.click({ force: true }));
+                        clicked = true;
+                        break;
+                      }
+                    }
+                    if (!clicked) {
+                      console.log('  🖱️  Submitting form via requestSubmit / Enter key...');
+                      await page.evaluate(() => {
+                        const form = document.querySelector('form');
+                        if (form) {
+                          if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                          else form.submit();
+                        }
+                      }).catch(() => {});
+                      await page.keyboard.press('Enter').catch(() => {});
+                    }
+                  }
+                  await sleep(3000);
+                }
+
+                // ── Step 8: Wait for redirect to stableaudio.com host ────────────────
+                if (!isStableAudioHost(page.url())) {
+                  console.log('  ⏳ Step 8: Waiting for redirect to stableaudio.com host...');
+                  try {
+                    await page.waitForURL(u => isStableAudioHost(u.toString()), { timeout: 40000 });
+                    console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
+                  } catch {
+                    const diag = await page.evaluate(() => {
+                      const alert = document.querySelector('[role="alert"], .ak-Error, [data-accent-color="red"], .error-message');
+                      const text = (document.body?.innerText || '').slice(0, 300).replace(/\s+/g, ' ');
+                      return { alert: alert ? alert.innerText.trim() : null, text };
+                    }).catch(() => ({ alert: null, text: '' }));
+                    if (diag.alert) console.warn(`  ⚠️ AuthKit alert on attempt ${attempt}: "${diag.alert}"`);
+                    console.warn(`  ⚠️ Did not reach stableaudio.com on attempt ${attempt} (at: ${page.url()}) [Page: "${diag.text}"]`);
+                    if (attempt < strategies.length) continue;
+                  }
+                } else {
+                  console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
+                }
+
+                // Wait for OAuth ?code= cleanup if present
+                if (isStableAudioHost(page.url()) && page.url().includes('code=')) {
+                  console.log('  🔄 OAuth code exchange in progress — waiting...');
                   await page.waitForURL(
-                    url => url.includes('stableaudio.com') && !url.includes('code='),
-                    { timeout: 30000 }
-                  );
-                  console.log(`  ✅ Code exchanged! URL: ${page.url()}`);
-                } catch {
-                  console.warn('  ⚠️ Code cleanup timeout — token may already be in localStorage');
+                    u => isStableAudioHost(u.toString()) && !u.toString().includes('code='),
+                    { timeout: 25000 }
+                  ).catch(() => {});
                 }
-              }
-              await sleep(3000);
+                await sleep(2500);
 
-              // 8c: Poll for token (90s window, 3 strategies)
-              console.log('  🔍 Step 8c: Polling for token...');
-              const tokenDeadline = Date.now() + 90000;
-              while (!capturedToken && Date.now() < tokenDeadline) {
-                // Strategy 1: Deep localStorage scan
-                const lsToken = await page.evaluate(() => {
-                  for (let i = 0; i < localStorage.length; i++) {
-                    const key = localStorage.key(i);
-                    if (!key) continue;
-                    try {
-                      const parsed = JSON.parse(localStorage.getItem(key));
-                      if (parsed?.body?.access_token) return parsed.body.access_token;
-                      if (parsed?.access_token)       return parsed.access_token;
-                      if (parsed?.idToken)             return parsed.idToken;
-                    } catch {}
+                // Handle /terms?onboarding=1 when on stableaudio.com
+                if (isStableAudioHost(page.url()) && (page.url().includes('/terms') || page.url().includes('onboarding'))) {
+                  console.log('  📜 Accepting onboarding terms on stableaudio.com...');
+                  const checkboxes = page.locator('input[type="checkbox"], [role="checkbox"]');
+                  const cbCount = await checkboxes.count().catch(() => 0);
+                  for (let c = 0; c < cbCount; c++) {
+                    await checkboxes.nth(c).click().catch(() => {});
+                    await sleep(250);
                   }
-                  return null;
-                }).catch(() => null);
-                if (lsToken) { capturedToken = lsToken; break; }
-
-                // Strategy 2: Fetch interceptor (sniff outgoing Authorization headers)
-                const intercepted = await page.evaluate(() => {
-                  if (window.__sniffedToken) return window.__sniffedToken;
-                  if (!window.__fetchPatched) {
-                    window.__fetchPatched = true;
-                    const origFetch = window.fetch;
-                    window.fetch = function(...args) {
-                      const [, opts] = args;
-                      const auth = opts?.headers?.Authorization || opts?.headers?.authorization || '';
-                      if (auth.startsWith('Bearer ') && auth.length > 60)
-                        window.__sniffedToken = auth.replace('Bearer ', '');
-                      return origFetch.apply(this, args);
-                    };
+                  const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("Agree"), button:has-text("Continue"), button:has-text("Get started"), button[type="submit"]').first();
+                  if (await acceptBtn.isVisible().catch(() => false)) {
+                    await humanClick(page, acceptBtn).catch(() => {});
                   }
-                  return null;
-                }).catch(() => null);
-                if (intercepted) { capturedToken = intercepted; break; }
+                  await sleep(3000);
+                }
 
-                await sleep(1500);
+                // ── Step 8c: Poll for token once on stableaudio.com ──────────────────
+                console.log('  🔍 Step 8c: Polling for token...');
+                const tokenDeadline = Date.now() + 50000;
+                let navigatedToGenerate = false;
+
+                while (!capturedToken && Date.now() < tokenDeadline) {
+                  if (isStableAudioHost(page.url())) {
+                    const storageToken = await page.evaluate(() => {
+                      const scanStore = (store) => {
+                        for (let i = 0; i < store.length; i++) {
+                          const key = store.key(i);
+                          if (!key) continue;
+                          const raw = store.getItem(key) || '';
+                          if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(raw.trim())) {
+                            return raw.trim();
+                          }
+                          try {
+                            const parsed = JSON.parse(raw);
+                            const tok = parsed?.body?.access_token || parsed?.access_token || parsed?.accessToken ||
+                                        parsed?.token || parsed?.idToken || parsed?.id_token || parsed?.state?.token ||
+                                        parsed?.state?.accessToken;
+                            if (tok && typeof tok === 'string' && tok.length > 40) return tok;
+                          } catch {}
+                        }
+                        return null;
+                      };
+                      return scanStore(localStorage) || scanStore(sessionStorage);
+                    }).catch(() => null);
+                    if (storageToken) { capturedToken = storageToken; break; }
+                  }
+
+                  const cookies = await context.cookies().catch(() => []);
+                  for (const c of cookies) {
+                    if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(c.value)) {
+                      capturedToken = c.value;
+                      console.log(`  🔑 JWT token captured from cookie (${c.name})!`);
+                      break;
+                    }
+                  }
+                  if (capturedToken) break;
+
+                  if (!navigatedToGenerate && isStableAudioHost(page.url()) && Date.now() > (tokenDeadline - 42000)) {
+                    navigatedToGenerate = true;
+                    console.log('  🌐 Navigating to stableaudio.com/generate to trigger API auth header...');
+                    await page.goto('https://stableaudio.com/generate', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                  }
+
+                  await sleep(1500);
+                }
+
+                if (capturedToken) {
+                  console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
+                  console.log(`  📧 ${email}`);
+                  console.log(`  🔑 Token: ${capturedToken.slice(0, 30)}...`);
+                  return capturedToken;
+                }
+
+                if (attempt < strategies.length) {
+                  console.warn(`  ⚠️ Token not captured on attempt ${attempt}. Trying next strategy...`);
+                  continue;
+                }
+                throw new Error(`Token not captured after all ${strategies.length} attempts (final URL: ${page.url()}).`);
+
+              } finally {
+                if (context) await context.close().catch(() => {});
+                try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch {}
               }
-
-              if (!capturedToken) throw new Error('Token not captured within 90s after OAuth code exchange.');
-
-              console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
-              console.log(`  📧 ${email}`);
-              console.log(`  🔑 Token: ${capturedToken.slice(0, 30)}...`);
-              return capturedToken;
-
-            } finally {
-              await browser.close().catch(() => {});
             }
           }
 
@@ -1021,6 +1468,13 @@ jobs:
             if (!res.ok) {
               const errText = await res.text();
               const errLower = errText.toLowerCase();
+              const isAuthError = (
+                res.status === 401 ||
+                res.status === 403 ||
+                errLower.includes('unauthorized') ||
+                errLower.includes('unable to verify user token') ||
+                errLower.includes('token')
+              );
               const isLimitError = (
                 res.status === 429 ||
                 (res.status === 400 && (
@@ -1030,12 +1484,13 @@ jobs:
                 ))
               );
 
-              if (isLimitError && !isRetry) {
-                console.warn('\n  ⚠️ API limit hit! Auto-creating new Stable Audio account...');
+              if ((isAuthError || isLimitError) && !isRetry) {
+                console.warn(`\n  ⚠️ ${isAuthError ? 'Auth/Token error (401 Unauthorized)' : 'API limit hit'}! Auto-creating new Stable Audio account...`);
                 currentToken = await createStableAudioAccount();
                 console.log('  🔄 Retrying prompt with new token...');
                 return generateStableAudio(prompt, lengthSeconds, true); // retry once
               }
+              if (isAuthError) throw new Error(`AUTH_ERROR (token invalid/expired, auto-recovery failed): ${errText.slice(0, 200)}`);
               if (isLimitError) throw new Error(`API_LIMIT_REACHED (auto-recovery also failed): ${errText.slice(0, 200)}`);
               throw new Error(`Stable Audio API error (${res.status}): ${errText.slice(0, 300)}`);
             }
@@ -1615,6 +2070,7 @@ jobs:
           ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
@@ -1803,7 +2259,8 @@ jobs:
           const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
             zedge_1: process.env.ZEDGE1_DB_URL,
             zedge_2: process.env.ZEDGE2_DB_URL,
-            zedge_3: process.env.ZEDGE3_DB_URL
+            zedge_3: process.env.ZEDGE3_DB_URL,
+            zedge_4: process.env.ZEDGE4_DB_URL
           }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
           if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
@@ -2799,6 +3256,6 @@ jobs:
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Mode | Auto-scan (all images missing metadata) |" >> $GITHUB_STEP_SUMMARY
           echo "| Queue path | ${{ github.event.inputs.image_queue_path }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3, zedge_4) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Image metadata generated via Gemini Web (image upload) and patched back to Firebase." >> $GITHUB_STEP_SUMMARY
