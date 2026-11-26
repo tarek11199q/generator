@@ -5145,8 +5145,8 @@ jobs:
             const url = String(fileUrl || '').trim();
             if (!url) return { ok: false, skipped: true, reason: 'missing_url' };
             if (!R2_WORKER_URL) return { ok: false, skipped: true, reason: 'missing_worker_url' };
-            const isR2Url = url.includes('.r2.dev/') || url.startsWith(R2_WORKER_URL.replace(/\/+$/, ''));
-            if (!isR2Url) return { ok: false, skipped: true, reason: 'non_r2_url' };
+            // v21 worker verifies the URL belongs to its own bucket (ETag check), so any http(s) URL can be sent.
+            if (!/^https?:\/\//i.test(url)) return { ok: false, skipped: true, reason: 'non_http_url' };
             const response = await fetchWithTimeout(R2_WORKER_URL, {
               method: 'DELETE',
               headers: {
@@ -5759,7 +5759,6 @@ jobs:
                 if (!dbsChecked.length) {
                   return sendJson(res, 400, { error: 'No Firebase DBs configured — aborted for safety' });
                 }
-
                 // 2. Paginate R2 objects via worker.js (?action=list)
                 const allObjects = [];
                 let cursor = null;
@@ -5779,7 +5778,16 @@ jobs:
                   pages++;
                 } while (cursor && pages < 50);
 
-                const orphans = allObjects.filter(o => o && o.key && !activeKeys.has(o.key));
+                // SAFETY: skip recent uploads (panel uploads to R2 first, writes Firebase after) + unknown prefixes
+                const checkedPrefixes = dbsChecked.map(k => String(k).replace(/^zedge_?/i, 'zedge') + '/');
+                const MIN_AGE_MS = 6 * 60 * 60 * 1000;
+                const now = Date.now();
+                const orphans = allObjects.filter(o => {
+                  if (!o || !o.key || activeKeys.has(o.key)) return false;
+                  if (!checkedPrefixes.some(p => o.key.startsWith(p))) return false; // only touch accounts whose DB was actually read
+                  const up = Date.parse(o.uploaded || '');
+                  return Number.isFinite(up) && (now - up) > MIN_AGE_MS;
+                });
                 const orphanBytes = orphans.reduce((s, o) => s + (Number(o.size) || 0), 0);
                 if (dryRun) {
                   return sendJson(res, 200, {
